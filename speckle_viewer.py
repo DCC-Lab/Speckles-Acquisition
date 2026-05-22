@@ -1,0 +1,644 @@
+#!/usr/bin/env python3
+"""
+Live speckle viewer with real-time contrast in a ROI.
+
+A minimal image viewer for an Aravis/GenICam camera (e.g. FLIR Blackfly S):
+streams frames continuously, lets you click to position a square ROI, and
+reports the speckle contrast (std/mean) of that ROI in real time.
+
+UI is built with mytk (https://github.com/DCC-Lab/myTk); camera I/O is Aravis.
+
+Run:
+    python3 speckle_viewer.py
+
+Click on the image to move the ROI. Use the controls to change ROI size and
+exposure. "Grain acf1" is the lag-1 horizontal autocorrelation of the ROI -- a
+quick speckle-grain-size gauge: ~0 means grains ~1 px (undersampled, contrast
+suppressed), ~0.5 means grains ~2 px (well sampled). Stop down the imaging
+aperture to grow the grains until acf1 ~ 0.5.
+"""
+
+# --- macOS / Homebrew env bootstrap (same trick as take_exposure_sweep.py) ---
+import os
+import sys
+
+if sys.platform == "darwin" and os.environ.get("_ARAVIS_BOOTSTRAP") != "1":
+    brew = "/opt/homebrew"
+    pyver = f"python{sys.version_info.major}.{sys.version_info.minor}"
+    extra = {
+        "DYLD_FALLBACK_LIBRARY_PATH": f"{brew}/lib",
+        "PYTHONPATH": f"{brew}/lib/{pyver}/site-packages",
+        "GI_TYPELIB_PATH": f"{brew}/lib/girepository-1.0",
+    }
+    env = os.environ.copy()
+    for key, value in extra.items():
+        env[key] = f"{value}:{env[key]}" if env.get(key) else value
+    env["_ARAVIS_BOOTSTRAP"] = "1"
+    os.execve(sys.executable, [sys.executable, *sys.argv], env)
+# -----------------------------------------------------------------------------
+
+import time
+from collections import deque
+from tkinter import filedialog, ttk
+
+import numpy as np
+from PIL import Image, ImageDraw, ImageTk
+
+import gi
+gi.require_version("Aravis", "0.8")
+from gi.repository import Aravis
+
+from mytk import App, Box, Button, Checkbox, FormattedEntry, IntEntry, Label, XYPlot
+from mytk.base import Base
+
+from matplotlib.ticker import FormatStrFormatter
+
+
+# =============================================================================
+# CONFIG
+# =============================================================================
+CAMERA_ID = None            # None = first camera found
+PIXEL_FORMAT = "Mono16"     # 12-bit sensor data in a 16-bit container (ceiling 65408).
+                            # "Mono8" is faster for live view if you don't need depth.
+N_STREAM_BUFFERS = 20       # ring of buffers cycled through the stream
+DISPLAY_MAX_WIDTH = 820     # on-screen image width (px); frame is subsampled to fit
+DEFAULT_ROI_SIZE = 300
+DEFAULT_EXPOSURE_US = 500
+REFRESH_MS = 30             # display refresh period
+SLOW_MS = 250               # period for plot redraw + applying exposure changes
+PLOT_HISTORY_S = 3          # rolling contrast-plot window (seconds)
+TILES_PER_AXIS = 5          # ROI is split into this many tiles per axis (N×N);
+                            # contrast = mean of each tile's std/mean. Tiling
+                            # removes ROI-scale illumination gradients.
+# =============================================================================
+
+
+class SpeckleCamera:
+    """Thin wrapper over an Aravis camera set up for linear speckle capture."""
+
+    def __init__(self, camera_id=CAMERA_ID, pixel_format=PIXEL_FORMAT,
+                 n_buffers=N_STREAM_BUFFERS):
+        self.pixel_format = pixel_format
+        self.n_buffers = n_buffers
+        self.stream = None
+
+        Aravis.update_device_list()
+        if Aravis.get_n_devices() == 0:
+            raise RuntimeError("No Aravis cameras found (try arv-tool-0.8).")
+        if camera_id is None:
+            camera_id = Aravis.get_device_id(0)
+        self.camera = Aravis.Camera.new(camera_id)
+        self._configure()
+
+        # Saturation level in the native dtype (Mono8 -> 255, Mono16 -> ~ceiling).
+        self.sat_level = 255 if self._is_mono8() else 65000
+
+    def _is_mono8(self):
+        return self.pixel_format == "Mono8"
+
+    def _configure(self):
+        cam = self.camera
+        cam.set_exposure_time_auto(Aravis.Auto.OFF)
+        try:
+            cam.set_gain_auto(Aravis.Auto.OFF)
+            gain_min, _ = cam.get_gain_bounds()
+            cam.set_gain(gain_min)
+        except Exception as exc:
+            print(f"Warning: could not pin gain to minimum: {exc}")
+        if cam.is_feature_available("GammaEnable"):
+            cam.set_boolean("GammaEnable", False)
+        cam.set_pixel_format_from_string(self.pixel_format)
+        cam.set_acquisition_mode(Aravis.AcquisitionMode.CONTINUOUS)
+        cam.set_exposure_time(float(DEFAULT_EXPOSURE_US))
+        # A hardware ROI persists on the camera across sessions; start full-frame.
+        self.set_full_region()
+
+    # -- description -----------------------------------------------------------
+    def description(self):
+        c = self.camera
+        return (f"{c.get_vendor_name()} {c.get_model_name()} "
+                f"(s/n {c.get_device_serial_number()})  {self.pixel_format}")
+
+    def exposure_bounds_us(self):
+        lo, hi = self.camera.get_exposure_time_bounds()
+        return int(lo), int(hi)
+
+    def get_exposure_us(self):
+        return int(self.camera.get_exposure_time())
+
+    def set_exposure_us(self, us):
+        lo, hi = self.camera.get_exposure_time_bounds()
+        self.camera.set_exposure_time(float(np.clip(us, lo, hi)))
+
+    def gain_bounds_db(self):
+        lo, hi = self.camera.get_gain_bounds()
+        return float(lo), float(hi)
+
+    def get_gain_db(self):
+        return float(self.camera.get_gain())
+
+    def set_gain_db(self, db):
+        lo, hi = self.camera.get_gain_bounds()
+        self.camera.set_gain(float(np.clip(db, lo, hi)))
+
+    # -- hardware ROI (sensor region of interest) ------------------------------
+    def sensor_size(self):
+        w, h = self.camera.get_sensor_size()
+        return int(w), int(h)
+
+    @staticmethod
+    def _snap(value, inc, lo, hi):
+        snapped = int(round(value / inc)) * inc
+        return int(max(lo, min(hi, snapped)))
+
+    def set_full_region(self):
+        """Read out the full sensor. Restarts the stream if it was running."""
+        was = self.is_running
+        if was:
+            self.stop()
+        cam = self.camera
+        # Move offset to 0 first: the width/height maxima depend on the offset.
+        _, _, w0, h0 = cam.get_region()
+        cam.set_region(0, 0, w0, h0)
+        _, w_max = cam.get_width_bounds()
+        _, h_max = cam.get_height_bounds()
+        cam.set_region(0, 0, w_max, h_max)
+        if was:
+            self.start()
+        return cam.get_region()
+
+    def set_roi_region(self, cx, cy, size):
+        """Read out only a ~`size` square centred near (cx, cy) in sensor pixels.
+
+        Width/height/offset are snapped to the sensor's increment rules (the
+        offset bounds are only valid once the size is set, so we set size first).
+        Restarts the stream because changing the region changes the payload.
+        """
+        was = self.is_running
+        if was:
+            self.stop()
+        cam = self.camera
+        # Reset offset to 0 so the width/height maxima reflect the full sensor.
+        _, _, w0, h0 = cam.get_region()
+        cam.set_region(0, 0, w0, h0)
+        w = self._snap(size, cam.get_width_increment(), *cam.get_width_bounds())
+        h = self._snap(size, cam.get_height_increment(), *cam.get_height_bounds())
+        cam.set_region(0, 0, w, h)   # set size first -> offset bounds become valid
+        x = self._snap(cx - w // 2, cam.get_x_offset_increment(),
+                       *cam.get_x_offset_bounds())
+        y = self._snap(cy - h // 2, cam.get_y_offset_increment(),
+                       *cam.get_y_offset_bounds())
+        cam.set_region(x, y, w, h)
+        if was:
+            self.start()
+        return cam.get_region()
+
+    # -- streaming -------------------------------------------------------------
+    @property
+    def is_running(self):
+        return self.stream is not None
+
+    def start(self):
+        if self.is_running:
+            return
+        self.stream = self.camera.create_stream(None, None)
+        payload = self.camera.get_payload()
+        for _ in range(self.n_buffers):
+            self.stream.push_buffer(Aravis.Buffer.new_allocate(payload))
+        self.camera.start_acquisition()
+
+    def stop(self):
+        if not self.is_running:
+            return
+        self.camera.stop_acquisition()
+        self.stream = None
+
+    def latest_frame(self):
+        """Drain the stream to the newest ready buffer; return it as (H, W) ndarray.
+
+        All popped buffers are recycled back into the stream. Returns None if no
+        frame is ready yet.
+        """
+        if not self.is_running:
+            return None
+        popped = []
+        while True:
+            buf = self.stream.try_pop_buffer()
+            if buf is None:
+                break
+            popped.append(buf)
+        if not popped:
+            return None
+
+        newest = popped[-1]
+        frame = None
+        if newest.get_status() == Aravis.BufferStatus.SUCCESS:
+            h = newest.get_image_height()
+            w = newest.get_image_width()
+            dtype = np.uint8 if self._is_mono8() else np.uint16
+            # Copy out: the buffer memory is reused once we push it back.
+            frame = np.frombuffer(newest.get_data(), dtype=dtype).reshape(h, w).copy()
+        for buf in popped:
+            self.stream.push_buffer(buf)
+        return frame
+
+
+def roi_stats(frame, top, left, size, sat_level, raw=None, n_tiles=TILES_PER_AXIS):
+    """ROI statistics with a *tiled* contrast.
+
+    The contrast is computed by splitting the ROI into an n_tiles x n_tiles grid,
+    taking std/mean within each tile, and averaging those per-tile contrasts.
+    Averaging local contrasts removes ROI-scale illumination gradients (which
+    would inflate a single global std/mean) and leaves the local speckle contrast.
+
+    Stats use `frame` (possibly background-subtracted); saturation and max use
+    `raw` (the un-subtracted sensor frame). `raw` defaults to `frame`.
+    """
+    roi = frame[top:top + size, left:left + size].astype(np.float64)
+    raw_src = raw if raw is not None else frame
+    raw_roi = raw_src[top:top + size, left:left + size].astype(np.float64)
+
+    # Tiled contrast: per-tile std/mean, averaged over the N×N tiles.
+    n = max(1, int(n_tiles))
+    tile = size // n
+    if tile >= 1:
+        m = tile * n
+        sub = roi[:m, :m].reshape(n, tile, n, tile)
+        tmean = sub.mean(axis=(1, 3))
+        tstd = sub.std(axis=(1, 3))
+        with np.errstate(divide="ignore", invalid="ignore"):
+            tcontrast = np.where(tmean > 0, tstd / tmean, np.nan)
+        contrast = (float(np.nanmean(tcontrast))
+                    if np.isfinite(tcontrast).any() else 0.0)
+    else:
+        contrast = 0.0
+
+    mean = float(roi.mean())
+    d = roi - mean
+    denom = float((d * d).mean())
+    acf1 = float((d[:, :-1] * d[:, 1:]).mean() / denom) if denom > 0 else 0.0
+    return {
+        "mean": mean,
+        "std": float(roi.std()),
+        "contrast": contrast,
+        "max": float(raw_roi.max()),
+        "sat_frac": float((raw_roi >= sat_level).mean()),
+        "acf1": acf1,
+        "n_tiles": n,
+    }
+
+
+class CameraView(Base):
+    """ttk.Label showing live frames, with a click-to-move square ROI overlay."""
+
+    def __init__(self, camera, roi_size_getter, stats_callback):
+        super().__init__()
+        self.camera = camera
+        self.roi_size_getter = roi_size_getter   # callable -> int
+        self.stats_callback = stats_callback      # callable(stats_dict)
+        self.roi_center = None                     # (cx, cy) in full-res coords
+        self.hardware_roi = False                  # if True, analyze the whole readout
+        self.stretch = True                        # auto-stretch display brightness
+        self._tkimage = None
+        self._scheduled = None
+        self._step = 1                             # display subsample factor
+        self._frame_times = deque(maxlen=30)
+        self.fps = 0.0
+        self.dt_mean_ms = 0.0
+        self.dt_std_ms = 0.0
+        self.background = None                      # averaged background frame (float) or None
+        self.subtract_bg = False
+        self._bg_frames = None                     # accumulator while capturing background
+        self._bg_target = 0
+        self.on_background_captured = None          # callable(mean_value)
+
+    def create_widget(self, master):
+        self.widget = ttk.Label(master, borderwidth=2, relief="groove")
+        self.widget.bind("<Button-1>", self._on_click)
+        self._scheduled = App.app.root.after(REFRESH_MS, self.update_display)
+
+    # -- ROI geometry ----------------------------------------------------------
+    def _roi_box(self, h, w):
+        if self.hardware_roi:
+            # The readout already *is* the ROI; analyze the whole (square) frame.
+            s = min(h, w)
+            return 0, 0, s
+        size = int(np.clip(self.roi_size_getter(), 8, min(h, w)))
+        if self.roi_center is None:
+            self.roi_center = (w // 2, h // 2)
+        cx, cy = self.roi_center
+        left = int(np.clip(cx - size // 2, 0, w - size))
+        top = int(np.clip(cy - size // 2, 0, h - size))
+        return top, left, size
+
+    def _on_click(self, event):
+        if self._step:
+            self.roi_center = (event.x * self._step, event.y * self._step)
+
+    def capture_background(self, n=16):
+        """Begin averaging n frames into a background frame. Block the beam first."""
+        self._bg_frames = []
+        self._bg_target = max(1, int(n))
+
+    # -- refresh loop ----------------------------------------------------------
+    def update_display(self):
+        frame = self.camera.latest_frame()
+        if frame is not None:
+            if self._bg_frames is not None:
+                self._bg_frames.append(frame.astype(np.float64))
+                if len(self._bg_frames) >= self._bg_target:
+                    self.background = np.mean(self._bg_frames, axis=0)
+                    self._bg_frames = None
+                    if self.on_background_captured is not None:
+                        self.on_background_captured(float(self.background.mean()))
+            self._render(frame)
+            self._frame_times.append(time.monotonic())
+            if len(self._frame_times) > 1:
+                dts = np.diff(np.asarray(self._frame_times))   # seconds
+                mean_dt = float(dts.mean())
+                self.fps = 1.0 / mean_dt if mean_dt > 0 else 0.0
+                self.dt_mean_ms = mean_dt * 1000.0
+                self.dt_std_ms = float(dts.std()) * 1000.0
+        self._scheduled = App.app.root.after(REFRESH_MS, self.update_display)
+
+    def _render(self, frame):
+        h, w = frame.shape
+        top, left, size = self._roi_box(h, w)
+
+        bg_on = (self.subtract_bg and self.background is not None
+                 and self.background.shape == frame.shape)
+        work = (frame.astype(np.float64) - self.background) if bg_on else frame
+
+        stats = roi_stats(work, top, left, size, self.camera.sat_level, raw=frame)
+        stats.update(roi=(top, left, size), fps=self.fps, bg_subtracted=bg_on,
+                     dt_mean_ms=self.dt_mean_ms, dt_std_ms=self.dt_std_ms)
+        if self.stats_callback:
+            self.stats_callback(stats)
+
+        # Subsample for display (fast, keeps the grainy speckle look).
+        step = max(1, w // DISPLAY_MAX_WIDTH)
+        self._step = step
+        small = work[::step, ::step].astype(np.float64)
+        if bg_on:
+            small = np.clip(small, 0, None)
+
+        if self.stretch:
+            lo, hi = np.percentile(small, [0.5, 99.5])
+            if hi <= lo:
+                hi = lo + 1
+        else:
+            lo, hi = 0, self.camera.sat_level
+        disp = np.clip((small - lo) / (hi - lo) * 255, 0, 255)
+        img = Image.fromarray(disp.astype(np.uint8), mode="L").convert("RGB")
+
+        draw = ImageDraw.Draw(img)
+        draw.rectangle(
+            [left // step, top // step, (left + size) // step, (top + size) // step],
+            outline=(0, 255, 0), width=2,
+        )
+        self._tkimage = ImageTk.PhotoImage(img)
+        self.widget.configure(image=self._tkimage)
+
+
+class ContrastPlot(XYPlot):
+    """XYPlot whose y-axis tick labels show 2 decimals.
+
+    update_plot() clears the axis each redraw, so the formatter is re-applied
+    here every time rather than once at setup.
+    """
+
+    def update_plot(self):
+        ax = self.first_axis
+        ax.clear()
+        ax.plot(self.x, self.y, "k-")
+        ax.yaxis.set_major_formatter(FormatStrFormatter("%.2f"))
+        self.figure.canvas.draw()
+        self.figure.canvas.flush_events()
+
+
+class SpeckleViewerApp(App):
+    def __init__(self):
+        super().__init__(name="Speckle Viewer")
+        self.window.widget.title("Speckle Viewer — live ROI contrast")
+        self.window.widget.protocol("WM_DELETE_WINDOW", self.quit)
+
+        self.camera = SpeckleCamera()
+        exp_lo, exp_hi = self.camera.exposure_bounds_us()
+
+        # --- image (left) -----------------------------------------------------
+        self.view = CameraView(
+            self.camera,
+            roi_size_getter=lambda: self.roi_size_control.value,
+            stats_callback=self.on_stats,
+        )
+        self.view.grid_into(self.window, row=0, column=0, padx=10, pady=10,
+                            sticky="nw")
+
+        # --- controls (right) -------------------------------------------------
+        self.controls = Box(label="Controls", width=360, height=640)
+        self.controls.grid_into(self.window, row=0, column=1, padx=10, pady=10,
+                                sticky="nsew")
+
+        self.start_button = Button("Stop", user_event_callback=self.toggle_run)
+        self.start_button.grid_into(self.controls, row=0, column=0, padx=8, pady=6,
+                                    sticky="w")
+        Button("Center ROI", user_event_callback=self.center_roi).grid_into(
+            self.controls, row=0, column=1, padx=8, pady=6, sticky="w")
+        Button("Save frame…", user_event_callback=self.save_frame).grid_into(
+            self.controls, row=0, column=2, padx=8, pady=6, sticky="w")
+
+        Label("ROI size (px):").grid_into(self.controls, row=1, column=0,
+                                          padx=8, pady=6, sticky="e")
+        self.roi_size_control = IntEntry(value=DEFAULT_ROI_SIZE, width=7,
+                                         minimum=8, maximum=2048)
+        self.roi_size_control.grid_into(self.controls, row=1, column=1, padx=8,
+                                        pady=6, sticky="w")
+        self.hw_roi_box = Checkbox(label="Hardware ROI",
+                                   user_callback=self.toggle_hardware_roi)
+        self.hw_roi_box.grid_into(self.controls, row=1, column=2, padx=8, pady=6,
+                                  sticky="w")
+        self.hw_roi_box.value = False
+
+        Label("Exposure (µs):").grid_into(self.controls, row=2, column=0,
+                                          padx=8, pady=6, sticky="e")
+        self.exposure_control = IntEntry(value=self.camera.get_exposure_us(),
+                                         width=10, minimum=exp_lo, maximum=exp_hi)
+        self.exposure_control.grid_into(self.controls, row=2, column=1, padx=8,
+                                        pady=6, sticky="w")
+        self._applied_exposure = self.camera.get_exposure_us()
+
+        gain_lo, gain_hi = self.camera.gain_bounds_db()
+        Label(f"Gain ({gain_lo:.0f}–{gain_hi:.0f} dB):").grid_into(
+            self.controls, row=3, column=0, padx=8, pady=6, sticky="e")
+        self.gain_control = FormattedEntry(value=self.camera.get_gain_db(),
+                                           character_width=8,
+                                           format_string="{0:.2f}")
+        self.gain_control.grid_into(self.controls, row=3, column=1, padx=8,
+                                    pady=6, sticky="w")
+        self._applied_gain = self.camera.get_gain_db()
+
+        self.stretch_box = Checkbox(label="Auto-stretch display",
+                                    user_callback=self.toggle_stretch)
+        self.stretch_box.grid_into(self.controls, row=4, column=0, columnspan=2,
+                                   padx=8, pady=6, sticky="w")
+
+        # --- background subtraction ------------------------------------------
+        Button("Capture background", user_event_callback=self.capture_background
+               ).grid_into(self.controls, row=5, column=0, padx=8, pady=6,
+                           sticky="w")
+        self.subtract_box = Checkbox(label="Subtract background",
+                                     user_callback=self.toggle_subtract)
+        self.subtract_box.grid_into(self.controls, row=5, column=1, columnspan=2,
+                                    padx=8, pady=6, sticky="w")
+        self.subtract_box.value = False
+        self.bg_label = Label("background: not captured")
+        self.bg_label.grid_into(self.controls, row=6, column=0, columnspan=3,
+                                padx=8, pady=2, sticky="w")
+        self.view.on_background_captured = self.on_background_captured
+
+        # --- live readout -----------------------------------------------------
+        self.readout = Box(label="ROI", width=360, height=205)
+        self.readout.grid_into(self.controls, row=7, column=0, columnspan=3,
+                               padx=8, pady=8, sticky="nsew")
+        self.contrast_label = Label("contrast: —")
+        self.mean_label = Label("mean: —    max: —")
+        self.sat_label = Label("saturated: —")
+        self.grain_label = Label("grain acf1: —")
+        self.roi_label = Label("ROI: —")
+        self.fps_label = Label("fps: —")
+        self.dt_label = Label("frame Δt: —")
+        for i, lab in enumerate([self.contrast_label, self.mean_label,
+                                 self.sat_label, self.grain_label,
+                                 self.roi_label, self.fps_label,
+                                 self.dt_label]):
+            lab.grid_into(self.readout, row=i, column=0, padx=8, pady=2,
+                          sticky="w")
+
+        # --- rolling contrast plot -------------------------------------------
+        self.plot = ContrastPlot(figsize=(3.6, 1.8))
+        self.plot.grid_into(self.controls, row=8, column=0, columnspan=3,
+                            padx=8, pady=8, sticky="nsew")
+        self.history = deque()   # (t, contrast)
+        self._t0 = time.monotonic()
+
+        self.camera.start()
+        self.after(SLOW_MS, self.slow_tick)
+
+    # -- callbacks -------------------------------------------------------------
+    def on_stats(self, s):
+        tag = "  (bg-sub)" if s.get("bg_subtracted") else ""
+        self.contrast_label.text = f"contrast:  {s['contrast']:.4f}{tag}"
+        self.mean_label.text = f"mean: {s['mean']:.0f}    max: {s['max']:.0f}"
+        self.sat_label.text = f"saturated: {100 * s['sat_frac']:.2f}%"
+        hint = ("~1px undersampled" if s["acf1"] < 0.2
+                else "~1.5px" if s["acf1"] < 0.4 else "~2px ok")
+        self.grain_label.text = f"grain acf1: {s['acf1']:.3f}  ({hint})"
+        t, l, sz = s["roi"]
+        nt = s.get("n_tiles", 1)
+        self.roi_label.text = f"ROI: {sz}px @ (row {t}, col {l})  {nt}×{nt} tiles"
+        self.fps_label.text = f"fps: {s['fps']:.1f}"
+        self.dt_label.text = (f"frame Δt: {s['dt_mean_ms']:.1f} ± "
+                              f"{s['dt_std_ms']:.1f} ms")
+        self.history.append((time.monotonic() - self._t0, s["contrast"]))
+
+    def slow_tick(self):
+        # Apply exposure changes typed into the entry. Store the *requested*
+        # value (not the camera's quantized readback) so we don't re-send the
+        # same exposure every tick -- re-applying mid-stream glitches frames.
+        try:
+            wanted = int(self.exposure_control.value)
+            if wanted != self._applied_exposure:
+                self.camera.set_exposure_us(wanted)
+                self._applied_exposure = wanted
+        except Exception:
+            pass
+
+        # Apply gain changes typed into the entry (same requested-value rule).
+        try:
+            wanted_gain = float(self.gain_control.value)
+            if abs(wanted_gain - self._applied_gain) > 1e-6:
+                self.camera.set_gain_db(wanted_gain)
+                self._applied_gain = wanted_gain
+        except Exception:
+            pass
+
+        # Redraw the rolling contrast plot.
+        now = time.monotonic() - self._t0
+        while self.history and now - self.history[0][0] > PLOT_HISTORY_S:
+            self.history.popleft()
+        if len(self.history) > 1:
+            self.plot.x = [t for t, _ in self.history]
+            self.plot.y = [c for _, c in self.history]
+            self.plot.update_plot()
+
+        if self.is_running:
+            self.after(SLOW_MS, self.slow_tick)
+
+    def toggle_run(self, event, button):
+        if self.camera.is_running:
+            self.camera.stop()
+            button.label = "Start"
+        else:
+            self.camera.start()
+            button.label = "Stop"
+
+    def center_roi(self, event, button):
+        self.view.roi_center = None  # recomputed to frame center next render
+
+    def toggle_stretch(self, checkbox):
+        self.view.stretch = bool(checkbox.value)
+
+    def toggle_subtract(self, checkbox):
+        self.view.subtract_bg = bool(checkbox.value)
+        if self.view.subtract_bg and self.view.background is None:
+            self.bg_label.text = "background: capture one first!"
+
+    def toggle_hardware_roi(self, checkbox):
+        if bool(checkbox.value):
+            sw, sh = self.camera.sensor_size()
+            cx, cy = self.view.roi_center or (sw // 2, sh // 2)
+            region = self.camera.set_roi_region(cx, cy, int(self.roi_size_control.value))
+            self.view.hardware_roi = True
+        else:
+            region = self.camera.set_full_region()
+            self.view.hardware_roi = False
+        # Region change resizes the frame, so any captured background no longer fits.
+        self.view.background = None
+        x, y, w, h = region
+        self.bg_label.text = f"background: re-capture (region now {w}×{h} @ {x},{y})"
+
+    def capture_background(self, event, button):
+        self.bg_label.text = "background: capturing… (block the beam)"
+        self.view.capture_background(16)
+
+    def on_background_captured(self, value):
+        self.bg_label.text = f"background: {value:.1f} DN (avg of 16 frames)"
+
+    def save_frame(self, event, button):
+        frame = self.camera.latest_frame()
+        if frame is None:
+            return
+        path = filedialog.asksaveasfilename(
+            title="Save current frame", defaultextension=".png",
+            filetypes=[("PNG", ".png")])
+        if path:
+            Image.fromarray(frame).save(path)
+
+    # App menu hooks (avoid NotImplementedError from the default menu).
+    def save(self):
+        self.save_frame(None, None)
+
+    def preferences(self):
+        pass
+
+    def quit(self):
+        try:
+            self.camera.stop()
+        except Exception:
+            pass
+        super().quit()
+
+
+if __name__ == "__main__":
+    app = SpeckleViewerApp()
+    app.mainloop()

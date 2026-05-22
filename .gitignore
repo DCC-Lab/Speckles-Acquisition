@@ -1,0 +1,14 @@
+# Captured image data — large binary (~GB); kept out of the code repo.
+# The folders remain on disk, just untracked.
+captures/
+captures_*/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# macOS
+.DS_Store
