@@ -61,7 +61,12 @@ from matplotlib.ticker import FormatStrFormatter
 CAMERA_ID = None            # None = first camera found
 PIXEL_FORMAT = "Mono16"     # 12-bit sensor data in a 16-bit container (ceiling 65408).
                             # "Mono8" is faster for live view if you don't need depth.
-N_STREAM_BUFFERS = 20       # ring of buffers cycled through the stream
+N_STREAM_BUFFERS = 48       # ring of buffers cycled through the stream. The
+                            # display drains every REFRESH_MS (~30 ms), so the
+                            # ring must hold one interval's worth of frames; at
+                            # ~1000 fps (tiny ROI) that's ~30, so 48 leaves
+                            # margin. Costs ~N x payload of RAM (Mono16 full
+                            # frame ~3 MB each), allocated up front in start().
 DISPLAY_MAX_WIDTH = 820     # on-screen image width (px); frame is subsampled to fit
 DEFAULT_ROI_SIZE = 300
 DEFAULT_EXPOSURE_US = 500
@@ -299,6 +304,22 @@ class SpeckleCamera:
         for buf in popped:
             self.stream.push_buffer(buf)
         return frame
+
+    def stream_stats(self):
+        """(n_completed, n_failures, n_underruns) counters from the live stream.
+
+        These count *every* frame the camera delivered, so they give the true
+        acquisition rate -- unlike the display loop, which only consumes the
+        newest buffer. Counters reset to 0 each time the stream is recreated
+        (e.g. on an ROI/pixel-format change). Returns zeros when not streaming.
+        """
+        if self.stream is None:
+            return (0, 0, 0)
+        try:
+            n_completed, n_failures, n_underruns = self.stream.get_statistics()
+            return (int(n_completed), int(n_failures), int(n_underruns))
+        except Exception:
+            return (0, 0, 0)
 
 
 def roi_stats(frame, top, left, size, sat_level, raw=None, n_tiles=TILES_PER_AXIS):
@@ -602,6 +623,13 @@ class SpeckleViewerApp(App):
         self.history = deque()   # (t, contrast)
         self._t0 = time.monotonic()
 
+        # True acquisition rate is derived in slow_tick from the stream counters
+        # (the display loop only samples the newest frame ~33x/s, so its rate is
+        # not the camera's). Track the previous (completed, dropped, time).
+        self._stream_prev = (0, 0, time.monotonic())
+        self._acq_fps = 0.0
+        self._acq_drop_rate = 0.0
+
         self.camera.start()
         self.after(SLOW_MS, self.slow_tick)
 
@@ -617,8 +645,10 @@ class SpeckleViewerApp(App):
         t, l, sz = s["roi"]
         nt = s.get("n_tiles", 1)
         self.roi_label.text = f"ROI: {sz}px @ (row {t}, col {l})  {nt}×{nt} tiles"
-        self.fps_label.text = f"fps: {s['fps']:.1f}"
-        self.dt_label.text = (f"frame Δt: {s['dt_mean_ms']:.1f} ± "
+        # fps (true acquisition rate) is owned by slow_tick via the stream
+        # counters; here we report only the display refresh interval, so the two
+        # numbers aren't confused (display is capped at ~1000/REFRESH_MS fps).
+        self.dt_label.text = (f"display Δt: {s['dt_mean_ms']:.1f} ± "
                               f"{s['dt_std_ms']:.1f} ms")
         self.history.append((time.monotonic() - self._t0, s["contrast"]))
 
@@ -649,6 +679,27 @@ class SpeckleViewerApp(App):
             if abs(wanted_fps - self._applied_fps) > 1e-3:
                 self.camera.set_frame_rate(wanted_fps)
                 self._applied_fps = wanted_fps
+        except Exception:
+            pass
+
+        # Report the *true* acquisition rate from the stream counters. The
+        # display loop only consumes the newest frame ~33x/s (REFRESH_MS), so
+        # its rate is not the camera's; this counts every delivered frame.
+        try:
+            n_done, n_fail, n_under = self.camera.stream_stats()
+            n_drop = n_fail + n_under
+            t = time.monotonic()
+            p_done, p_drop, p_t = self._stream_prev
+            dn, dd, dt = n_done - p_done, n_drop - p_drop, t - p_t
+            if dn < 0:                       # stream was recreated -> counters reset
+                dn, dd = n_done, n_drop
+            if dt > 0:
+                self._acq_fps = dn / dt
+                self._acq_drop_rate = max(dd, 0) / dt
+            self._stream_prev = (n_done, n_drop, t)
+            drop = (f"  (−{self._acq_drop_rate:.0f}/s dropped)"
+                    if self._acq_drop_rate > 0.5 else "")
+            self.fps_label.text = f"fps: {self._acq_fps:.1f}{drop}"
         except Exception:
             pass
 
