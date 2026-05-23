@@ -141,6 +141,43 @@ class SpeckleCamera:
         lo, hi = self.camera.get_gain_bounds()
         self.camera.set_gain(float(np.clip(db, lo, hi)))
 
+    # -- frame rate (decoupled from exposure) ----------------------------------
+    def enable_manual_frame_rate(self, enable=True):
+        """Flip AcquisitionFrameRateEnable so AcquisitionFrameRate is honored.
+
+        Without this, the camera ignores AcquisitionFrameRate and runs at its
+        default rate regardless of ROI -- the rate is NOT free-running at max.
+        """
+        dev = self.camera.get_device()
+        if self.camera.is_feature_available("AcquisitionFrameRateAuto"):
+            try:
+                dev.set_string_feature_value("AcquisitionFrameRateAuto", "Off")
+            except Exception:
+                pass
+        for name in ("AcquisitionFrameRateEnable", "AcquisitionFrameRateEnabled"):
+            if self.camera.is_feature_available(name):
+                dev.set_boolean_feature_value(name, enable)
+                return name
+        return None
+
+    def frame_rate_bounds(self):
+        lo, hi = self.camera.get_frame_rate_bounds()
+        return float(lo), float(hi)
+
+    def get_frame_rate(self):
+        return float(self.camera.get_frame_rate())
+
+    def set_frame_rate(self, fps):
+        """Enable manual control and set the rate, clamped to the current bounds.
+
+        Bounds depend on ROI/pixel format/exposure, so they are read after the
+        enable flip (which is what makes the high end reflect the real ceiling).
+        """
+        self.enable_manual_frame_rate(True)
+        lo, hi = self.camera.get_frame_rate_bounds()
+        self.camera.set_frame_rate(float(np.clip(fps, lo, hi)))
+        return self.get_frame_rate()
+
     # -- hardware ROI (sensor region of interest) ------------------------------
     def sensor_size(self):
         w, h = self.camera.get_sensor_size()
@@ -477,28 +514,37 @@ class SpeckleViewerApp(App):
                                     pady=6, sticky="w")
         self._applied_gain = self.camera.get_gain_db()
 
+        Label("Frame rate (fps):").grid_into(self.controls, row=4, column=0,
+                                             padx=8, pady=6, sticky="e")
+        self.framerate_control = FormattedEntry(value=self.camera.get_frame_rate(),
+                                                character_width=8,
+                                                format_string="{0:.1f}")
+        self.framerate_control.grid_into(self.controls, row=4, column=1, padx=8,
+                                         pady=6, sticky="w")
+        self._applied_fps = self.camera.get_frame_rate()
+
         self.stretch_box = Checkbox(label="Auto-stretch display",
                                     user_callback=self.toggle_stretch)
-        self.stretch_box.grid_into(self.controls, row=4, column=0, columnspan=2,
+        self.stretch_box.grid_into(self.controls, row=5, column=0, columnspan=2,
                                    padx=8, pady=6, sticky="w")
 
         # --- background subtraction ------------------------------------------
         Button("Capture background", user_event_callback=self.capture_background
-               ).grid_into(self.controls, row=5, column=0, padx=8, pady=6,
+               ).grid_into(self.controls, row=6, column=0, padx=8, pady=6,
                            sticky="w")
         self.subtract_box = Checkbox(label="Subtract background",
                                      user_callback=self.toggle_subtract)
-        self.subtract_box.grid_into(self.controls, row=5, column=1, columnspan=2,
+        self.subtract_box.grid_into(self.controls, row=6, column=1, columnspan=2,
                                     padx=8, pady=6, sticky="w")
         self.subtract_box.value = False
         self.bg_label = Label("background: not captured")
-        self.bg_label.grid_into(self.controls, row=6, column=0, columnspan=3,
+        self.bg_label.grid_into(self.controls, row=7, column=0, columnspan=3,
                                 padx=8, pady=2, sticky="w")
         self.view.on_background_captured = self.on_background_captured
 
         # --- live readout -----------------------------------------------------
         self.readout = Box(label="ROI", width=360, height=205)
-        self.readout.grid_into(self.controls, row=7, column=0, columnspan=3,
+        self.readout.grid_into(self.controls, row=8, column=0, columnspan=3,
                                padx=8, pady=8, sticky="nsew")
         self.contrast_label = Label("contrast: —")
         self.mean_label = Label("mean: —    max: —")
@@ -516,7 +562,7 @@ class SpeckleViewerApp(App):
 
         # --- rolling contrast plot -------------------------------------------
         self.plot = ContrastPlot(figsize=(3.6, 1.8))
-        self.plot.grid_into(self.controls, row=8, column=0, columnspan=3,
+        self.plot.grid_into(self.controls, row=9, column=0, columnspan=3,
                             padx=8, pady=8, sticky="nsew")
         self.history = deque()   # (t, contrast)
         self._t0 = time.monotonic()
@@ -559,6 +605,15 @@ class SpeckleViewerApp(App):
             if abs(wanted_gain - self._applied_gain) > 1e-6:
                 self.camera.set_gain_db(wanted_gain)
                 self._applied_gain = wanted_gain
+        except Exception:
+            pass
+
+        # Apply frame-rate changes: enable manual control + set AcquisitionFrameRate.
+        try:
+            wanted_fps = float(self.framerate_control.value)
+            if abs(wanted_fps - self._applied_fps) > 1e-3:
+                self.camera.set_frame_rate(wanted_fps)
+                self._applied_fps = wanted_fps
         except Exception:
             pass
 
