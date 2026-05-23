@@ -48,7 +48,8 @@ import gi
 gi.require_version("Aravis", "0.8")
 from gi.repository import Aravis
 
-from mytk import App, Box, Button, Checkbox, FormattedEntry, IntEntry, Label, XYPlot
+from mytk import (App, Box, Button, Checkbox, FormattedEntry, IntEntry, Label,
+                  PopupMenu, XYPlot)
 from mytk.base import Base
 
 from matplotlib.ticker import FormatStrFormatter
@@ -177,6 +178,26 @@ class SpeckleCamera:
         lo, hi = self.camera.get_frame_rate_bounds()
         self.camera.set_frame_rate(float(np.clip(fps, lo, hi)))
         return self.get_frame_rate()
+
+    # -- pixel format ----------------------------------------------------------
+    def set_pixel_format(self, pixel_format):
+        """Switch the sensor pixel format (e.g. "Mono8" or "Mono16").
+
+        PixelFormat is locked while the camera streams, so the stream is stopped
+        and restarted (which also reallocates buffers for the new payload).
+        Updates sat_level so the contrast/saturation math matches the new bit
+        depth; latest_frame() reads the dtype from pixel_format on its own.
+        """
+        if pixel_format == self.pixel_format:
+            return
+        was = self.is_running
+        if was:
+            self.stop()
+        self.camera.set_pixel_format_from_string(pixel_format)
+        self.pixel_format = pixel_format
+        self.sat_level = 255 if self._is_mono8() else 65000
+        if was:
+            self.start()
 
     # -- hardware ROI (sensor region of interest) ------------------------------
     def sensor_size(self):
@@ -523,28 +544,36 @@ class SpeckleViewerApp(App):
                                          pady=6, sticky="w")
         self._applied_fps = self.camera.get_frame_rate()
 
+        Label("Pixel format:").grid_into(self.controls, row=5, column=0,
+                                         padx=8, pady=6, sticky="e")
+        self.pixel_format_menu = PopupMenu(["Mono8", "Mono16"],
+                                           user_callback=self.on_pixel_format)
+        self.pixel_format_menu.grid_into(self.controls, row=5, column=1, padx=8,
+                                         pady=6, sticky="w")
+        self.pixel_format_menu.value = self.camera.pixel_format
+
         self.stretch_box = Checkbox(label="Auto-stretch display",
                                     user_callback=self.toggle_stretch)
-        self.stretch_box.grid_into(self.controls, row=5, column=0, columnspan=2,
+        self.stretch_box.grid_into(self.controls, row=6, column=0, columnspan=2,
                                    padx=8, pady=6, sticky="w")
 
         # --- background subtraction ------------------------------------------
         Button("Capture background", user_event_callback=self.capture_background
-               ).grid_into(self.controls, row=6, column=0, padx=8, pady=6,
+               ).grid_into(self.controls, row=7, column=0, padx=8, pady=6,
                            sticky="w")
         self.subtract_box = Checkbox(label="Subtract background",
                                      user_callback=self.toggle_subtract)
-        self.subtract_box.grid_into(self.controls, row=6, column=1, columnspan=2,
+        self.subtract_box.grid_into(self.controls, row=7, column=1, columnspan=2,
                                     padx=8, pady=6, sticky="w")
         self.subtract_box.value = False
         self.bg_label = Label("background: not captured")
-        self.bg_label.grid_into(self.controls, row=7, column=0, columnspan=3,
+        self.bg_label.grid_into(self.controls, row=8, column=0, columnspan=3,
                                 padx=8, pady=2, sticky="w")
         self.view.on_background_captured = self.on_background_captured
 
         # --- live readout -----------------------------------------------------
         self.readout = Box(label="ROI", width=360, height=205)
-        self.readout.grid_into(self.controls, row=8, column=0, columnspan=3,
+        self.readout.grid_into(self.controls, row=9, column=0, columnspan=3,
                                padx=8, pady=8, sticky="nsew")
         self.contrast_label = Label("contrast: —")
         self.mean_label = Label("mean: —    max: —")
@@ -562,7 +591,7 @@ class SpeckleViewerApp(App):
 
         # --- rolling contrast plot -------------------------------------------
         self.plot = ContrastPlot(figsize=(3.6, 1.8))
-        self.plot.grid_into(self.controls, row=9, column=0, columnspan=3,
+        self.plot.grid_into(self.controls, row=10, column=0, columnspan=3,
                             padx=8, pady=8, sticky="nsew")
         self.history = deque()   # (t, contrast)
         self._t0 = time.monotonic()
@@ -642,6 +671,17 @@ class SpeckleViewerApp(App):
 
     def toggle_stretch(self, checkbox):
         self.view.stretch = bool(checkbox.value)
+
+    def on_pixel_format(self, menu, index):
+        fmt = menu.value
+        try:
+            self.camera.set_pixel_format(fmt)
+        except Exception as exc:
+            print(f"Could not set pixel format to {fmt}: {exc}")
+            return
+        # Bit depth changed, so any captured background (old depth) no longer applies.
+        self.view.background = None
+        self.bg_label.text = f"background: re-capture (pixel format now {fmt})"
 
     def toggle_subtract(self, checkbox):
         self.view.subtract_bg = bool(checkbox.value)
