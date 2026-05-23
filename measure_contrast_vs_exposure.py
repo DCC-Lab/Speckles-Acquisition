@@ -20,6 +20,10 @@ import datetime as dt
 
 import numpy as np
 
+import matplotlib
+matplotlib.use("Agg")            # headless: render straight to a PNG
+import matplotlib.pyplot as plt
+
 import gi
 gi.require_version("Aravis", "0.8")
 from gi.repository import Aravis
@@ -30,10 +34,12 @@ from find_max_fps_exposure import longest_exposure_for
 # --- CONFIG ---------------------------------------------------------------
 ROI = 128                 # px; the high-fps operating ROI (128x128 hits the ceiling)
 TARGET_FPS = 995          # just under the ~998 fps ceiling
-MAX_EFFECTIVE_MS = 20.0   # synthesize effective exposures up to this many ms
-N_FRAMES = 2000           # consecutive frames to acquire (~2 s at ~1 kHz)
+MAX_EFFECTIVE_MS = 100.0  # synthesize effective exposures up to this many ms
+N_FRAMES = 5000           # consecutive frames to acquire (~5 s at ~1 kHz); enough
+                          # that even N~100 sums still average over ~50 windows
 SAT_LEVEL = 255           # Mono8 saturation level
 OUT_CSV = f"contrast_vs_synthetic_exposure_{dt.date.today()}.csv"
+OUT_PNG = f"contrast_vs_synthetic_exposure_{dt.date.today()}.png"
 
 
 def setup_operating_point(cam):
@@ -126,6 +132,23 @@ def main():
                       "mean_contrast", "std_contrast", "n_windows"])
         wri.writerows(rows)
     print(f"\nSaved {OUT_CSV}")
+
+    # Plot contrast vs effective exposure (y starts at 0 so a dark/noise run --
+    # tiny contrast -- is obvious versus real speckle).
+    eff = [r[1] for r in rows]
+    cont = [r[3] for r in rows]
+    err = [r[4] for r in rows]
+    fig, ax = plt.subplots(figsize=(6, 4))
+    ax.errorbar(eff, cont, yerr=err, fmt="o-", capsize=3, ms=4)
+    ax.set_xlabel("effective exposure  N×(exposure+gap)  [ms]")
+    ax.set_ylabel("speckle contrast  K = σ/⟨I⟩")
+    ax.set_title(f"{fps:.0f} fps, {exp} µs exposure, {ROI}×{ROI}  "
+                 f"(single-frame ⟨I⟩={frames.mean():.0f})")
+    ax.set_ylim(bottom=0)
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(OUT_PNG, dpi=120)
+    print(f"Saved {OUT_PNG}")
 
     if cam.is_running:
         cam.stop()
