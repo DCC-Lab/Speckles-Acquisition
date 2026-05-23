@@ -41,7 +41,8 @@ def run_short(cam):
         sem = sc / np.sqrt(m) if m else 0.0
         rows.append(dict(exp_us=ap, exp_ms=ap / 1000.0, frames=m, K=mc,
                          std=sc, sem=sem, mean=lvl, mx=mx, sat=sat))
-        flag = "  <- starved" if lvl < 5 else ("  <- sat" if sat > 0.001 else "")
+        flag = ("  <- starved" if lvl < 0.02 * cam.sat_level
+                else ("  <- sat" if sat > 0.001 else ""))
         print(f"{ap:7d} {m:7d} {mc:10.4f} {sem:9.5f} {lvl:7.1f}{flag}")
     return rows
 
@@ -55,8 +56,10 @@ def run_long(cam):
     print(f"  {len(frames)} frames, dropped {dropped}, "
           f"mean {frames.mean():.1f}, max {frames.max()}")
     n_max = max(1, min(int(longm.MAX_EFFECTIVE_MS * 1000 / period), len(frames)))
+    n_values = np.unique(np.geomspace(1, n_max, 80).astype(int))   # log-spaced -> reach 1 s
     rows = []
-    for N in range(1, n_max + 1):
+    for N in n_values:
+        N = int(N)
         mc, sc, nw = longm.contrast_for_N(frames, N)
         rows.append(dict(N=N, eff_ms=N * period / 1000.0, integ_ms=N * exp / 1000.0,
                          K=mc, std=sc, sem=sc / np.sqrt(nw) if nw else 0.0, nwin=nw))
@@ -64,7 +67,7 @@ def run_long(cam):
 
 
 def main():
-    cam = SpeckleCamera(pixel_format="Mono8")
+    cam = SpeckleCamera(pixel_format=shortm.PIXEL_FORMAT)
     sw, sh = cam.sensor_size()
     cam.set_roi_region(sw // 2, sh // 2, shortm.ROI)
     print(cam.description())
@@ -110,7 +113,7 @@ def main():
     ax.set_xlabel("exposure  [ms]")
     ax.set_ylabel("speckle contrast  K = σ/⟨I⟩")
     ax.set_title(f"full speckle contrast vs exposure  {shortm.ROI}×{shortm.ROI} "
-                 f"Mono8 (one session)")
+                 f"{shortm.PIXEL_FORMAT} (one session)")
     ax.set_ylim(bottom=0)
     ax.grid(True, which="both", alpha=0.3)
     ax.legend()

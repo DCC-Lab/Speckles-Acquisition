@@ -35,7 +35,8 @@ from speckle_viewer import SpeckleCamera, roi_stats
 
 # --- CONFIG ---------------------------------------------------------------
 ROI = 128                 # px; same operating ROI as the long-exposure tool
-SAT_LEVEL = 255           # Mono8 saturation level
+PIXEL_FORMAT = "Mono16"   # 12-bit data in a 16-bit container (~4096 levels);
+                          # spans the 8 us .. 1 ms dynamic range that Mono8 can't
 # Log-spaced exposures from 8 us to 850 us (min hardware exposure is 4 us).
 EXPOSURES_US = sorted({int(round(x)) for x in np.geomspace(8, 850, 18)})
 # Photon-matched averaging (see module docstring): frames x exposure ~ const.
@@ -64,6 +65,7 @@ def measure_at(cam, exp_us, m):
         b = stream.timeout_pop_buffer(500000)
         if b:
             stream.push_buffer(b)
+    dtype = np.uint8 if cam.pixel_format == "Mono8" else np.uint16
     cs, levels, mx, sat = [], [], 0, 0.0
     while len(cs) < m:
         b = stream.timeout_pop_buffer(500000)
@@ -71,8 +73,8 @@ def measure_at(cam, exp_us, m):
             break
         if b.get_status() == Aravis.BufferStatus.SUCCESS:
             h, w = b.get_image_height(), b.get_image_width()
-            fr = np.frombuffer(b.get_data(), dtype=np.uint8).reshape(h, w)
-            s = roi_stats(fr, 0, 0, w, SAT_LEVEL)
+            fr = np.frombuffer(b.get_data(), dtype=dtype).reshape(h, w)
+            s = roi_stats(fr, 0, 0, w, cam.sat_level)
             cs.append(s["contrast"])
             levels.append(s["mean"])
             mx = max(mx, int(fr.max()))
@@ -84,7 +86,7 @@ def measure_at(cam, exp_us, m):
 
 
 def main():
-    cam = SpeckleCamera(pixel_format="Mono8")
+    cam = SpeckleCamera(pixel_format=PIXEL_FORMAT)
     sw, sh = cam.sensor_size()
     cam.set_roi_region(sw // 2, sh // 2, ROI)
     cam.enable_manual_frame_rate(False)               # free-run: exposure sets freely
@@ -100,7 +102,8 @@ def main():
         ap, mc, sc, lvl, mx, sat = measure_at(cam, e, m)
         sem = sc / np.sqrt(m) if m else 0.0
         rows.append((ap, ap / 1000.0, m, mc, sc, sem, lvl, mx, sat))
-        flag = "  <- starved" if lvl < 5 else ("  <- saturating" if sat > 0.001 else "")
+        flag = ("  <- starved" if lvl < 0.02 * cam.sat_level
+                else ("  <- saturating" if sat > 0.001 else ""))
         print(f"{ap:7d} {ap / 1000.0:8.3f} {m:7d} {mc:10.4f} {sem:9.5f} "
               f"{lvl:7.1f} {mx:5d} {sat * 100:6.2f}{flag}")
 
@@ -120,7 +123,8 @@ def main():
     ax.set_xscale("log")
     ax.set_xlabel("exposure  [ms]")
     ax.set_ylabel("speckle contrast  K = σ/⟨I⟩")
-    ax.set_title(f"short-exposure sweep  {ROI}×{ROI} Mono8 (photon-matched, SEM bars)")
+    ax.set_title(f"short-exposure sweep  {ROI}×{ROI} {PIXEL_FORMAT} "
+                 f"(photon-matched, SEM bars)")
     ax.set_ylim(bottom=0)
     ax.grid(True, which="both", alpha=0.3)
     fig.tight_layout()

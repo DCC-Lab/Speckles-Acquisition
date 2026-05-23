@@ -34,10 +34,11 @@ from find_max_fps_exposure import longest_exposure_for
 # --- CONFIG ---------------------------------------------------------------
 ROI = 128                 # px; the high-fps operating ROI (128x128 hits the ceiling)
 TARGET_FPS = 995          # just under the ~998 fps ceiling
-MAX_EFFECTIVE_MS = 100.0  # synthesize effective exposures up to this many ms
-N_FRAMES = 5000           # consecutive frames to acquire (~5 s at ~1 kHz); enough
-                          # that even N~100 sums still average over ~50 windows
-SAT_LEVEL = 255           # Mono8 saturation level
+MAX_EFFECTIVE_MS = 1000.0 # synthesize effective exposures up to this many ms (1 s)
+N_FRAMES = 12000          # consecutive frames to acquire (~12 s at ~1 kHz); at 1 s
+                          # (N~994) that still leaves ~12 non-overlapping windows
+SAT_LEVEL = 255           # default for contrast_for_N (contrast is scale-invariant)
+PIXEL_FORMAT = "Mono16"   # 12-bit data in a 16-bit container (~4096 levels)
 OUT_CSV = f"contrast_vs_synthetic_exposure_{dt.date.today()}.csv"
 OUT_PNG = f"contrast_vs_synthetic_exposure_{dt.date.today()}.png"
 
@@ -67,6 +68,7 @@ def acquire_consecutive(cam, n_frames):
         if b:
             stream.push_buffer(b)
     c0, f0, u0 = cam.stream_stats()
+    dtype = np.uint8 if cam.pixel_format == "Mono8" else np.uint16
     frames = []
     while len(frames) < n_frames:
         b = stream.timeout_pop_buffer(500000)
@@ -75,7 +77,7 @@ def acquire_consecutive(cam, n_frames):
             raise RuntimeError("timed out waiting for a frame")
         if b.get_status() == Aravis.BufferStatus.SUCCESS:
             h, w = b.get_image_height(), b.get_image_width()
-            frames.append(np.frombuffer(b.get_data(), dtype=np.uint8)
+            frames.append(np.frombuffer(b.get_data(), dtype=dtype)
                           .reshape(h, w).copy())
         stream.push_buffer(b)
     c1, f1, u1 = cam.stream_stats()
@@ -95,7 +97,7 @@ def contrast_for_N(frames, N, sat_level=SAT_LEVEL):
 
 
 def main():
-    cam = SpeckleCamera(pixel_format="Mono8")
+    cam = SpeckleCamera(pixel_format=PIXEL_FORMAT)
     fps, exp, period = setup_operating_point(cam)
     print(cam.description())
     print(f"Operating point: {fps:.1f} fps, exposure {exp} us, "
@@ -108,22 +110,26 @@ def main():
         print("  WARNING: frames dropped -> summed exposures contain gaps larger "
               "than the readout dead time; the curve is not a clean exposure sweep.")
 
-    sat_frac = float((frames >= SAT_LEVEL).mean())
+    sat_frac = float((frames >= cam.sat_level).mean())
     print(f"  single-frame level: mean {frames.mean():.1f}, max {frames.max()}, "
           f"saturated {sat_frac * 100:.2f}%")
     if sat_frac > 0.001:
         print("  WARNING: pixels saturate -> summed contrast is biased low.")
 
     n_max = max(1, min(int(MAX_EFFECTIVE_MS * 1000 / period), len(frames)))
+    # Log-spaced N so we reach 1 s (~994 frames) without thousands of redundant
+    # points, and the curve is evenly sampled on the log-x axis.
+    n_values = np.unique(np.geomspace(1, n_max, 80).astype(int))
     rows = []
-    print(f"\n{'N':>3} {'eff_exp_ms':>11} {'integ_ms':>9} {'contrast':>10} "
+    print(f"\n{'N':>4} {'eff_exp_ms':>11} {'integ_ms':>9} {'contrast':>10} "
           f"{'std':>8} {'windows':>8}")
-    for N in range(1, n_max + 1):
+    for N in n_values:
+        N = int(N)
         eff_ms = N * period / 1000.0          # N x (exposure + gap)  [user convention]
         integ_ms = N * exp / 1000.0           # N x exposure  [actual integrated light]
         mean_c, std_c, nw = contrast_for_N(frames, N)
         rows.append((N, eff_ms, integ_ms, mean_c, std_c, nw))
-        print(f"{N:>3} {eff_ms:11.3f} {integ_ms:9.3f} {mean_c:10.4f} "
+        print(f"{N:>4} {eff_ms:11.3f} {integ_ms:9.3f} {mean_c:10.4f} "
               f"{std_c:8.4f} {nw:8d}")
 
     with open(OUT_CSV, "w", newline="") as fh:
