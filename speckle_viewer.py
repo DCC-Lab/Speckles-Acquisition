@@ -704,6 +704,22 @@ class SpeckleViewerApp(App):
         else:
             region = self.camera.set_full_region()
             self.view.hardware_roi = False
+
+        # A region change moves the achievable frame-rate ceiling, but the camera
+        # keeps running at the previously pinned AcquisitionFrameRate until a new
+        # rate is pushed. Re-apply so a small ROI actually runs fast: ride the new
+        # ceiling up when an ROI is engaged, drop back under the (lower) full-frame
+        # ceiling when it is released. Keep the field and _applied_fps in sync so
+        # slow_tick doesn't immediately re-send a stale value.
+        try:
+            _, hi = self.camera.frame_rate_bounds()
+            target = hi if self.view.hardware_roi else float(self.framerate_control.value)
+            achieved = self.camera.set_frame_rate(target)
+            self.framerate_control.value = achieved
+            self._applied_fps = float(self.framerate_control.value)
+        except Exception as exc:
+            print(f"Could not re-apply frame rate after ROI change: {exc}")
+
         # Region change resizes the frame, so any captured background no longer fits.
         self.view.background = None
         x, y, w, h = region
