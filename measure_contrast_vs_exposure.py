@@ -140,12 +140,13 @@ def main():
     err = [r[4] for r in rows]
     fig, ax = plt.subplots(figsize=(6, 4))
     ax.errorbar(eff, cont, yerr=err, fmt="o-", capsize=3, ms=4)
+    ax.set_xscale("log")             # exposure spans ~2 decades; log-x shows the decay
     ax.set_xlabel("effective exposure  N×(exposure+gap)  [ms]")
     ax.set_ylabel("speckle contrast  K = σ/⟨I⟩")
     ax.set_title(f"{fps:.0f} fps, {exp} µs exposure, {ROI}×{ROI}  "
                  f"(single-frame ⟨I⟩={frames.mean():.0f})")
     ax.set_ylim(bottom=0)
-    ax.grid(True, alpha=0.3)
+    ax.grid(True, which="both", alpha=0.3)
     fig.tight_layout()
     fig.savefig(OUT_PNG, dpi=120)
     print(f"Saved {OUT_PNG}")
