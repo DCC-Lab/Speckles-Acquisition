@@ -590,8 +590,14 @@ class SpeckleViewerApp(App):
                           sticky="w")
 
         # --- rolling contrast plot -------------------------------------------
+        # Redrawing the plot every tick is the most expensive UI step; the
+        # checkbox lets you switch it off to keep the live image responsive.
+        self.update_plot_box = Checkbox(label="Update contrast plot")
+        self.update_plot_box.grid_into(self.controls, row=10, column=0,
+                                       columnspan=3, padx=8, pady=6, sticky="w")
+        self.update_plot_box.value = True
         self.plot = ContrastPlot(figsize=(3.6, 1.8))
-        self.plot.grid_into(self.controls, row=10, column=0, columnspan=3,
+        self.plot.grid_into(self.controls, row=11, column=0, columnspan=3,
                             padx=8, pady=8, sticky="nsew")
         self.history = deque()   # (t, contrast)
         self._t0 = time.monotonic()
@@ -646,11 +652,12 @@ class SpeckleViewerApp(App):
         except Exception:
             pass
 
-        # Redraw the rolling contrast plot.
+        # Keep the history pruned regardless, so the plot is current whenever
+        # it's shown, but skip the (expensive) redraw when the box is off.
         now = time.monotonic() - self._t0
         while self.history and now - self.history[0][0] > PLOT_HISTORY_S:
             self.history.popleft()
-        if len(self.history) > 1:
+        if self.update_plot_box.value and len(self.history) > 1:
             self.plot.x = [t for t, _ in self.history]
             self.plot.y = [c for _, c in self.history]
             self.plot.update_plot()
