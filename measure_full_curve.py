@@ -22,6 +22,7 @@ import matplotlib.pyplot as plt
 from speckle_viewer import SpeckleCamera
 import measure_contrast_short_exposure as shortm
 import measure_contrast_vs_exposure as longm
+import register
 
 DATE = dt.date.today()
 SHORT_CSV = f"contrast_vs_exposure_short_{DATE}.csv"
@@ -55,6 +56,10 @@ def run_long(cam):
     frames, dropped = longm.acquire_consecutive(cam, longm.N_FRAMES)
     print(f"  {len(frames)} frames, dropped {dropped}, "
           f"mean {frames.mean():.1f}, max {frames.max()}")
+    if longm.ALIGN:
+        frames, shifts = register.align_stack(frames)
+        print(f"  registered (vibration removed): shift RMS "
+              f"{register.shift_rms(shifts):.2f} px, max {np.max(np.abs(shifts)):.2f} px")
     n_max = max(1, min(int(longm.MAX_EFFECTIVE_MS * 1000 / period), len(frames)))
     n_values = np.unique(np.geomspace(1, n_max, 80).astype(int))   # log-spaced -> reach 1 s
     rows = []

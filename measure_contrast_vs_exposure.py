@@ -30,6 +30,7 @@ from gi.repository import Aravis
 
 from speckle_viewer import SpeckleCamera, roi_stats
 from find_max_fps_exposure import longest_exposure_for
+import register
 
 # --- CONFIG ---------------------------------------------------------------
 ROI = 128                 # px; the high-fps operating ROI (128x128 hits the ceiling)
@@ -39,6 +40,8 @@ N_FRAMES = 12000          # consecutive frames to acquire (~12 s at ~1 kHz); at 
                           # (N~994) that still leaves ~12 non-overlapping windows
 SAT_LEVEL = 255           # default for contrast_for_N (contrast is scale-invariant)
 PIXEL_FORMAT = "Mono16"   # 12-bit data in a 16-bit container (~4096 levels)
+ALIGN = True              # phase-correlation register frames before summing, to
+                          # remove rigid vibration that would fake decorrelation
 OUT_CSV = f"contrast_vs_synthetic_exposure_{dt.date.today()}.csv"
 OUT_PNG = f"contrast_vs_synthetic_exposure_{dt.date.today()}.png"
 
@@ -70,11 +73,16 @@ def acquire_consecutive(cam, n_frames):
     c0, f0, u0 = cam.stream_stats()
     dtype = np.uint8 if cam.pixel_format == "Mono8" else np.uint16
     frames = []
+    stalls = 0
     while len(frames) < n_frames:
         b = stream.timeout_pop_buffer(500000)
-        if b is None:
-            cam.stop()
-            raise RuntimeError("timed out waiting for a frame")
+        if b is None:                         # brief USB hiccup: tolerate and retry;
+            stalls += 1                       # only give up if it never resumes
+            if stalls >= 10:                  # ~5 s with no frame -> stream is dead
+                cam.stop()
+                raise RuntimeError(f"stream stalled after {len(frames)} frames")
+            continue
+        stalls = 0
         if b.get_status() == Aravis.BufferStatus.SUCCESS:
             h, w = b.get_image_height(), b.get_image_width()
             frames.append(np.frombuffer(b.get_data(), dtype=dtype)
@@ -115,6 +123,11 @@ def main():
           f"saturated {sat_frac * 100:.2f}%")
     if sat_frac > 0.001:
         print("  WARNING: pixels saturate -> summed contrast is biased low.")
+
+    if ALIGN:
+        frames, shifts = register.align_stack(frames)
+        print(f"  registered (vibration removed): shift RMS {register.shift_rms(shifts):.2f} px, "
+              f"max {np.max(np.abs(shifts)):.2f} px")
 
     n_max = max(1, min(int(MAX_EFFECTIVE_MS * 1000 / period), len(frames)))
     # Log-spaced N so we reach 1 s (~994 frames) without thousands of redundant
