@@ -514,7 +514,7 @@ class SpeckleViewerApp(App):
                             sticky="nw")
 
         # --- controls (right) -------------------------------------------------
-        self.controls = Box(label="Controls", width=360, height=640)
+        self.controls = Box(label="Controls")
         self.controls.grid_into(self.window, row=0, column=1, padx=10, pady=10,
                                 sticky="nsew")
 
