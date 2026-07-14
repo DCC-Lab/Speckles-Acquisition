@@ -1,59 +1,39 @@
 # Speckles-Acquisition
 
-Outils d'**imagerie de contraste de speckle laser (LSCI)** pour caractériser la
-dynamique d'un échantillon à partir de son motif de speckle. Le code pilote une
-caméra **FLIR Blackfly S** (via Aravis/GenICam) depuis Python, capture des
-images de speckle et mesure le **contraste de speckle** en fonction du **temps
-d'exposition** de la caméra.
+Outils d'**imagerie de contraste de speckle laser (LSCI)** pour caractériser la dynamique d'un échantillon à partir de son motif de speckle. Le code pilote une caméra **FLIR Blackfly S** (via Aravis/GenICam) depuis Python, capture des images de speckle et mesure le **contraste de speckle** en fonction du **temps d'exposition** de la caméra.
 
-> Vous cherchez un guide destiné à un agent IA (Claude, Codex…) ? Voir
-> [`AGENTS.md`](AGENTS.md). La physique détaillée est dans
-> [`LSCI_THEORY.md`](LSCI_THEORY.md). Le journal des séances d'expérience est
-> dans [`SESSION_NOTES.md`](SESSION_NOTES.md).
+> Vous cherchez un guide destiné à un agent IA (Claude, Codex…) ? Voir [`AGENTS.md`](AGENTS.md). La physique détaillée est dans [`LSCI_THEORY.md`](LSCI_THEORY.md). Le journal des séances d'expérience est dans [`SESSION_NOTES.md`](SESSION_NOTES.md).
 
 ---
 
 ## À quoi ça sert
 
-Quand une lumière laser cohérente éclaire un milieu diffusant, on observe un
-motif granuleux : le **speckle**. Sur une image, on quantifie son « piqué » par
-le **contraste** :
+Quand une lumière laser cohérente éclaire un milieu diffusant, on observe un motif granuleux : le **speckle**. Sur une image, on quantifie son « piqué » par le **contraste** :
 
 ```
 K = σ / ⟨I⟩          (écart-type / moyenne de l'intensité dans une région)
 ```
 
 - Un échantillon **statique** garde un speckle net → contraste élevé.
-- Un échantillon **en mouvement** (flux sanguin, mouvement brownien, particules
-  en suspension…) fait scintiller le speckle. Pendant une exposition, le motif
-  se brouille et le contraste **baisse**.
+- Un échantillon **en mouvement** (flux sanguin, mouvement brownien, particules en suspension…) fait scintiller le speckle. Pendant une exposition, le motif se brouille et le contraste **baisse**.
 
-En mesurant **K en fonction du temps d'exposition T**, on obtient une **courbe
-de décorrélation**. Sa forme et son temps caractéristique τ renseignent sur la
-vitesse de la dynamique dans l'échantillon. C'est l'objet de ce dépôt :
-**acquérir cette courbe, proprement, puis l'ajuster à un modèle physique.**
+En mesurant **K en fonction du temps d'exposition T**, on obtient une **courbe de décorrélation**. Sa forme et son temps caractéristique τ renseignent sur la vitesse de la dynamique dans l'échantillon. C'est l'objet de ce dépôt : **acquérir cette courbe, proprement, puis l'ajuster à un modèle physique.**
 
 ---
 
 ## Installation / prérequis
 
-Le matériel de référence est une **FLIR Blackfly S BFS-U3-63S4M** (USB3), mais
-n'importe quelle caméra compatible **Aravis 0.8 / GenICam** devrait fonctionner.
+Le matériel de référence est une **FLIR Blackfly S BFS-U3-63S4M** (USB3), mais n'importe quelle caméra compatible **Aravis 0.8 / GenICam** devrait fonctionner.
 
 Il faut :
 
-- **Aravis 0.8 + PyGObject** (bindings caméra). Sur macOS : via Homebrew
-  (`/opt/homebrew`).
+- **Aravis 0.8 + PyGObject** (bindings caméra). Sur macOS : via Homebrew (`/opt/homebrew`).
 - **Python 3** avec **numpy, Pillow, scipy, matplotlib**.
-- **`mytk`** (bibliothèque GUI [`DCC-Lab/myTk`]) — uniquement pour l'interface
-  graphique live, pas pour les scripts de mesure.
+- **`mytk`** (bibliothèque GUI [`DCC-Lab/myTk`]) — uniquement pour l'interface graphique live, pas pour les scripts de mesure.
 
 ### Note macOS (important)
 
-Sur macOS, la pile scientifique (numpy…) vit dans le Python de python.org, alors
-qu'Aravis vient de Homebrew. Les deux ne se voient pas sans quelques variables
-d'environnement. **Bonne nouvelle : c'est géré automatiquement.** Les scripts qui
-parlent à la caméra se « bootstrapent » eux-mêmes ; il suffit de lancer :
+Sur macOS, la pile scientifique (numpy…) vit dans le Python de python.org, alors qu'Aravis vient de Homebrew. Les deux ne se voient pas sans quelques variables d'environnement. **Bonne nouvelle : c'est géré automatiquement.** Les scripts qui parlent à la caméra se « bootstrapent » eux-mêmes ; il suffit de lancer :
 
 ```bash
 python3 speckle_viewer.py
@@ -71,16 +51,13 @@ arv-tool-0.8          # liste les caméras GenICam détectées
 
 ## L'interface graphique (GUI) : `speckle_viewer.py`
 
-Un visualiseur **temps réel** pour cadrer l'expérience, régler la caméra et voir
-le contraste en direct **avant** de lancer une mesure.
+Un visualiseur **temps réel** pour cadrer l'expérience, régler la caméra et voir le contraste en direct **avant** de lancer une mesure.
 
 ```bash
 python3 speckle_viewer.py
 ```
 
-À gauche : l'image live, avec un **carré de région d'intérêt (ROI)** superposé.
-**Cliquez** dans l'image pour déplacer la ROI ; c'est sur cette zone que tout est
-calculé. À droite, les contrôles :
+À gauche : l'image live, avec un **carré de région d'intérêt (ROI)** superposé. **Cliquez** dans l'image pour déplacer la ROI ; c'est sur cette zone que tout est calculé. À droite, les contrôles :
 
 | Contrôle | Rôle |
 |---|---|
@@ -96,41 +73,24 @@ calculé. À droite, les contrôles :
 | **Auto-stretch display** | Étire l'affichage pour la lisibilité (n'affecte **pas** la mesure). |
 | **Capture background / Subtract background** | Capture une image de fond (lumière bloquée) et la soustrait en direct. |
 
-**Lecture live (encadré « ROI »)** : contraste, moyenne et max du signal,
-fraction de pixels saturés, taille de grain de speckle, cadence réelle et Δt
-entre images. Un **graphe déroulant** trace le contraste dans le temps (que l'on
-peut désactiver pour garder l'image fluide).
+**Lecture live (encadré « ROI »)** : contraste, moyenne et max du signal, fraction de pixels saturés, taille de grain de speckle, cadence réelle et Δt entre images. Un **graphe déroulant** trace le contraste dans le temps (que l'on peut désactiver pour garder l'image fluide).
 
-Le contraste est calculé **par tuiles** (la ROI est découpée en N×N tuiles, et
-K est la moyenne des std/moyenne de chaque tuile) : cela élimine les gradients
-d'éclairage à l'échelle de la ROI.
+Le contraste est calculé **par tuiles** (la ROI est découpée en N×N tuiles, et K est la moyenne des std/moyenne de chaque tuile) : cela élimine les gradients d'éclairage à l'échelle de la ROI.
 
-À retenir : **surveillez la moyenne du signal**. À très courte exposition, le
-signal réel peut être à peine au-dessus du piédestal de la caméra ; le bruit de
-fond a alors son propre contraste qui peut se faire passer pour de la
-décorrélation. Utilisez la soustraction de fond et, au besoin,
-`characterize_background.py` (voir ci-dessous).
+À retenir : **surveillez la moyenne du signal**. À très courte exposition, le signal réel peut être à peine au-dessus du piédestal de la caméra ; le bruit de fond a alors son propre contraste qui peut se faire passer pour de la décorrélation. Utilisez la soustraction de fond et, au besoin, `characterize_background.py` (voir ci-dessous).
 
 ---
 
 ## Le backend : scripts de mesure et d'analyse
 
-Deux familles : ceux qui **parlent à la caméra** (acquisition) et ceux qui
-**traitent des données déjà enregistrées** (analyse). La plupart se configurent
-en **éditant le bloc `CONFIG` en haut du fichier**.
+Deux familles : ceux qui **parlent à la caméra** (acquisition) et ceux qui **traitent des données déjà enregistrées** (analyse). La plupart se configurent en **éditant le bloc `CONFIG` en haut du fichier**.
 
 ### Deux façons de construire la courbe
 
-1. **Balayage d'exposition réel** (extrémité courte, ~8 µs à ~850 µs) : on change
-   réellement l'exposition de la caméra et on mesure K à chaque valeur. Exact,
-   mais les longues expositions saturent.
-2. **Sommation d'images / exposition synthétique** (extrémité longue, ~1 ms à
-   ~1 s) : on acquiert des milliers d'images consécutives à haute cadence, puis on
-   en **somme N** pour simuler une exposition N fois plus longue.
+1. **Balayage d'exposition réel** (extrémité courte, ~8 µs à ~850 µs) : on change réellement l'exposition de la caméra et on mesure K à chaque valeur. Exact, mais les longues expositions saturent.
+2. **Sommation d'images / exposition synthétique** (extrémité longue, ~1 ms à ~1 s) : on acquiert des milliers d'images consécutives à haute cadence, puis on en **somme N** pour simuler une exposition N fois plus longue.
 
-Comme les vibrations décalent tout le motif de speckle d'une image à l'autre (ce
-qui imiterait une fausse décorrélation lors de la sommation), les images sont
-**recalées** par corrélation de phase (FFT) avant d'être sommées.
+Comme les vibrations décalent tout le motif de speckle d'une image à l'autre (ce qui imiterait une fausse décorrélation lors de la sommation), les images sont **recalées** par corrélation de phase (FFT) avant d'être sommées.
 
 ### Acquisition (caméra requise)
 
@@ -158,36 +118,24 @@ qui imiterait une fausse décorrélation lors de la sommation), les images sont
 
 ## Déroulé type d'une expérience
 
-1. **Cadrer et régler** avec `speckle_viewer.py` : positionner la ROI, régler
-   l'exposition/gain, vérifier que le signal n'est ni saturé ni trop faible.
+1. **Cadrer et régler** avec `speckle_viewer.py` : positionner la ROI, régler l'exposition/gain, vérifier que le signal n'est ni saturé ni trop faible.
 2. **(Optionnel) Mesurer le fond** objectif bouché : `characterize_background.py`.
-3. **Acquérir la courbe** en gardant l'éclairage fixe :
-   `python3 measure_full_curve.py`.
-4. **Ajuster** : `python3 fit_decorrelation.py` (lit les CSV les plus récents) →
-   temps de décorrélation τ et figures.
+3. **Acquérir la courbe** en gardant l'éclairage fixe : `python3 measure_full_curve.py`.
+4. **Ajuster** : `python3 fit_decorrelation.py` (lit les CSV les plus récents) → temps de décorrélation τ et figures.
 
 ---
 
 ## Données et bonnes pratiques
 
-- Le contraste **dépend de la région** (échantillonnage du speckle, éclairage).
-  Toute comparaison entre runs doit utiliser **la même ROI**. Comparez les
-  *formes* de courbes plus que les valeurs absolues de K.
-- Pour des mesures fiables : sortie **linéaire** (gamma désactivé — fait par le
-  code), **gain minimal**, et attention à la **saturation** (les pixels saturés
-  biaisent le contraste vers le bas).
-- **Les images capturées ne sont pas dans le dépôt Git.** Les dossiers
-  `captures/` et `captures_*/` (plusieurs Go de PNG) sont volontairement ignorés ;
-  seuls le code, la doc et les petits CSV de résultats sont versionnés.
+- Le contraste **dépend de la région** (échantillonnage du speckle, éclairage). Toute comparaison entre runs doit utiliser **la même ROI**. Comparez les *formes* de courbes plus que les valeurs absolues de K.
+- Pour des mesures fiables : sortie **linéaire** (gamma désactivé — fait par le code), **gain minimal**, et attention à la **saturation** (les pixels saturés biaisent le contraste vers le bas).
+- **Les images capturées ne sont pas dans le dépôt Git.** Les dossiers `captures/` et `captures_*/` (plusieurs Go de PNG) sont volontairement ignorés ; seuls le code, la doc et les petits CSV de résultats sont versionnés.
 
 ---
 
 ## Où trouver quoi
 
-- **`LSCI_THEORY.md`** — la physique : modèles de contraste, décorrélation,
-  ajustements.
-- **`SESSION_NOTES.md`** — le carnet de laboratoire (réglages et résultats des
-  séances passées). À consulter en premier pour reprendre un travail.
+- **`LSCI_THEORY.md`** — la physique : modèles de contraste, décorrélation, ajustements.
+- **`SESSION_NOTES.md`** — le carnet de laboratoire (réglages et résultats des séances passées). À consulter en premier pour reprendre un travail.
 - **`AGENTS.md`** — guide technique pour un agent IA travaillant sur ce code.
-- **`*_decorrelation_data/`, `paper_*_data/`, `milk_*_data/`** — jeux de données
-  sauvegardés (CSV + figures + petit README).
+- **`*_decorrelation_data/`, `paper_*_data/`, `milk_*_data/`** — jeux de données sauvegardés (CSV + figures + petit README).
