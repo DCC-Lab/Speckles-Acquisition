@@ -422,6 +422,7 @@ class CameraView(Base):
         self._k = 1.0
         self._origin = (0, 0)
         self._frame_shape = None                   # (h, w) of the last rendered frame
+        self.last_frame = None                     # newest raw frame, for saving
         self._frame_times = deque(maxlen=30)
         self.fps = 0.0
         self.dt_mean_ms = 0.0
@@ -515,6 +516,7 @@ class CameraView(Base):
     def _render(self, frame):
         h, w = frame.shape
         self._frame_shape = (h, w)
+        self.last_frame = frame
         bg_on = (self.subtract_bg and self.background is not None
                  and self.background.shape == frame.shape)
         work = (frame.astype(np.float64) - self.background) if bg_on else frame
@@ -965,7 +967,10 @@ class SpeckleViewerApp(App):
         self.bg_label.text = f"background: {value:.1f} DN (avg of 16 frames)"
 
     def save_frame(self, event, button):
-        frame = self.camera.latest_frame()
+        # The frame kept by the last render, not latest_frame(): that one drains
+        # the stream and is usually None by the time a button click arrives, so
+        # asking it here silently did nothing most of the time.
+        frame = self.view.last_frame
         if frame is None:
             return
         path = filedialog.asksaveasfilename(
