@@ -3,6 +3,10 @@
 captures/
 captures_*/
 
+# Raw frame files written by capture_timeseries.py, wherever its --out points.
+# Multi-GB; the small contrast.csv and the JSON sidecars stay trackable.
+frames.raw
+
 # Python
 __pycache__/
 *.py[cod]
