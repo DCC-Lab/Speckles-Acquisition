@@ -1,0 +1,10 @@
+# Python dependencies for analysis and the live viewer.
+# PyGObject requires a C compiler, pkg-config, Cairo and GLib/GObject
+# introspection development libraries before installation.
+# Camera access additionally requires native Aravis 0.8 and its typelib.
+numpy
+Pillow
+scipy
+matplotlib
+mytk>=1.9.0
+PyGObject>=3.50

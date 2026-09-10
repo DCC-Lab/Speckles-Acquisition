@@ -2,7 +2,7 @@
 
 Outils d'**imagerie de contraste de speckle laser (LSCI)** pour caractériser la dynamique d'un échantillon à partir de son motif de speckle. Le code pilote une caméra **FLIR Blackfly S** (via Aravis/GenICam) depuis Python, capture des images de speckle et mesure le **contraste de speckle** en fonction du **temps d'exposition** de la caméra.
 
-> Vous cherchez un guide destiné à un agent IA (Claude, Codex…) ? Voir [`AGENTS.md`](AGENTS.md). La physique détaillée est dans [`LSCI_THEORY.md`](LSCI_THEORY.md). Le journal des séances d'expérience est dans [`SESSION_NOTES.md`](SESSION_NOTES.md).
+> Vous cherchez un guide destiné à un agent IA (Claude, Codex…) ? Voir [`AGENTS.md`](AGENTS.md). La physique détaillée est dans [`LSCI_THEORY.md`](LSCI_THEORY.md). Le journal des séances d'expérience est dans [`INSTALL-Old mac intel.md`](INSTALL-Old%20mac%20intel.md).
 
 ---
 
@@ -27,9 +27,36 @@ Le matériel de référence est une **FLIR Blackfly S BFS-U3-63S4M** (USB3), mai
 
 Il faut :
 
-- **Aravis 0.8 + PyGObject** (bindings caméra). Sur macOS : via Homebrew (`/opt/homebrew`).
+- **Aravis 0.8 + PyGObject** (bindings caméra). Sur macOS : bibliothèques natives via Homebrew (`/opt/homebrew` sur Apple Silicon, `/usr/local` sur Intel), PyGObject dans le venv.
 - **Python 3** avec **numpy, Pillow, scipy, matplotlib**.
 - **`mytk`** (bibliothèque GUI [`DCC-Lab/myTk`]) — uniquement pour l'interface graphique live, pas pour les scripts de mesure.
+
+### Environnement virtuel
+
+Depuis la racine du dépôt :
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+```
+
+Pour les sessions suivantes, lancez simplement `source .venv/bin/activate`.
+Pour quitter l'environnement : `deactivate`. Le dossier `.venv/` est ignoré par Git.
+`requirements.txt` inclut les dépendances d'analyse, `DCC-Lab/myTk` et PyGObject.
+Avant l'installation, PyGObject nécessite un compilateur C fonctionnel,
+pkg-config et les bibliothèques de développement Cairo et GLib/GObject
+introspection. Sur macOS, les outils de développement Xcode doivent être
+installés et configurés. Aravis 0.8 et son typelib restent des dépendances
+natives à installer séparément ; pip ne les fournit pas.
+
+Avec Homebrew installé, préparez les bibliothèques natives avant pip :
+
+```bash
+brew install aravis gobject-introspection cairo pkgconf
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+```
 
 ### Note macOS (important)
 
@@ -136,6 +163,6 @@ Comme les vibrations décalent tout le motif de speckle d'une image à l'autre (
 ## Où trouver quoi
 
 - **`LSCI_THEORY.md`** — la physique : modèles de contraste, décorrélation, ajustements.
-- **`SESSION_NOTES.md`** — le carnet de laboratoire (réglages et résultats des séances passées). À consulter en premier pour reprendre un travail.
+- **`INSTALL-Old mac intel.md`** — le carnet de laboratoire (réglages et résultats des séances passées). À consulter en premier pour reprendre un travail.
 - **`AGENTS.md`** — guide technique pour un agent IA travaillant sur ce code.
 - **`*_decorrelation_data/`, `paper_*_data/`, `milk_*_data/`** — jeux de données sauvegardés (CSV + figures + petit README).

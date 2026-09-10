@@ -1,5 +1,51 @@
 # FLIR / Aravis exposure-sweep session notes
 
+## Mise en service sur ancienne machine macOS (2026-09-10)
+
+Machine: macOS 13.7.8 Intel (`x86_64`), Python.org 3.14.7. L'objectif était
+de faire fonctionner Aravis/PyGObject sans installer l'application Xcode.
+
+- Les **Command Line Tools seuls** ont été installés avec `xcode-select --install`.
+  Clang 14.0.3 est disponible et fonctionne; Xcode.app n'est pas nécessaire.
+- Homebrew a été installé dans `/usr/local` (préfixe Intel), puis les
+  dépendances natives disponibles ont été installées: GLib 2.88.3, Cairo
+  1.18.4, libusb 1.0.30, pkg-config, Meson, Ninja et Bison.
+- `brew install aravis` demandait plus d'une centaine de dépendances
+  multimédia (GTK/GStreamer) et échouait sur macOS 13. Aravis 0.8.36 a donc
+  été compilé directement depuis son archive vérifiée SHA-256, avec seulement
+  l'USB et l'introspection activés:
+
+  ```bash
+  meson setup /tmp/aravis-build /tmp/speckles-aravis-build/aravis-0.8.36 \
+    --prefix=/usr/local --buildtype=release \
+    -Dviewer=disabled -Dgst-plugin=disabled -Dtests=false \
+    -Ddocumentation=disabled -Dusb=enabled -Dintrospection=enabled
+  meson compile -C /tmp/aravis-build
+  meson install -C /tmp/aravis-build
+  ```
+
+- La formule Homebrew de `gobject-introspection` échouait à cause d'un conflit
+  avec pip Python 3.14. GObject Introspection 1.86.0 a été compilé avec Meson
+  et le Bison Homebrew (`/usr/local/opt/bison/bin/bison`), puis installé dans
+  `/usr/local`.
+- PyGObject 3.58.0 et Pycairo 1.29.1 ont ensuite été construits dans `.venv`
+  avec `PKG_CONFIG_PATH=/usr/local/lib/pkgconfig` et
+  `GI_TYPELIB_PATH=/usr/local/lib/girepository-1.0`.
+- Les scripts de bootstrap macOS utilisent maintenant `/usr/local` sur Intel
+  et `/opt/homebrew` sur Apple Silicon (`speckle_viewer.py` et
+  `take_exposure_sweep.py`).
+
+Vérification logicielle réussie:
+
+```text
+Aravis/PyGObject import OK
+arv-tool-0.8: No device found
+```
+
+Le logiciel est donc prêt; au dernier test, aucune caméra n'était connectée ou
+visible sur USB. Après connexion de la Blackfly, relancer `arv-tool-0.8`, puis
+`python speckle_viewer.py` depuis `.venv`.
+
 ## What's here
 
 Two scripts:

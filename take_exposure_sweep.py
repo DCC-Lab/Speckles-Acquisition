@@ -8,7 +8,7 @@ Edit the CONFIG block below, then run:
 """
 
 # --- macOS / Homebrew env bootstrap ------------------------------------------
-# Homebrew puts PyGObject and Aravis under /opt/homebrew. A python.org Python
+# Homebrew uses /opt/homebrew on Apple Silicon and /usr/local on Intel. A python.org Python
 # won't find them without DYLD_FALLBACK_LIBRARY_PATH / PYTHONPATH /
 # GI_TYPELIB_PATH set BEFORE the process starts. Re-exec self once with those
 # vars so the user can just `python3 take_exposure_sweep.py`. Harmless when
@@ -17,7 +17,7 @@ import os
 import sys
 
 if sys.platform == "darwin" and os.environ.get("_ARAVIS_BOOTSTRAP") != "1":
-    brew = "/opt/homebrew"
+    brew = "/opt/homebrew" if os.uname().machine == "arm64" else "/usr/local"
     pyver = f"python{sys.version_info.major}.{sys.version_info.minor}"
     extra = {
         "DYLD_FALLBACK_LIBRARY_PATH": f"{brew}/lib",
