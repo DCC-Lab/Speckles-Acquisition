@@ -11,6 +11,12 @@ What it writes into --out:
 
     contrast.csv    one row per frame: time, frame_id, contrast per ROI, ratio
     contrast.png    both contrasts and their ratio against time
+
+Both are kept current *while the run is in progress*: every row is flushed as it
+is measured, and the plot is redrawn every --plot-every seconds (5 s by default)
+to the same file. Point an image viewer at contrast.png and watch a multi-hour
+acquisition live; tail contrast.csv, or open it in another process, at any time.
+A run killed halfway still leaves everything written up to that point.
     frames.raw      raw sensor frames, appended back to back (optional)
     frames.json     shape/dtype/region/decimation, so frames.raw can be read back
     run.json        the full settings and the drop audit for the run
@@ -62,6 +68,7 @@ import argparse
 import csv
 import json
 import signal
+import threading
 import time
 from pathlib import Path
 
@@ -123,8 +130,11 @@ def parse_args(argv=None):
                         "achievable rate on the same link")
     p.add_argument("--tiles", type=int, default=TILES_PER_AXIS,
                    help="contrast is the mean of NxN per-tile std/mean")
+    p.add_argument("--plot-every", type=float, default=5.0, metavar="SECONDS",
+                   help="redraw contrast.png this often while running; "
+                        "0 draws it only at the end")
     p.add_argument("--no-plot", action="store_true",
-                   help="skip contrast.png at the end of the run")
+                   help="never write contrast.png")
     return p.parse_args(argv)
 
 
@@ -197,8 +207,61 @@ def write_plot(path, t, contrasts, ratio, subtitle):
                 if window > 1 else "every frame")
     ax.set_title(f"Speckle contrast time series  ({smoothed})\n{subtitle}",
                  fontsize=10)
-    fig.savefig(path, dpi=130)
+    fig.savefig(path, dpi=130, format="png")   # explicit: temp files end .tmp
     plt.close(fig)
+
+
+class LivePlotter:
+    """Redraws contrast.png every `period` seconds, off the acquisition thread.
+
+    Plotting a long series costs hundreds of ms, which is far too long to spend
+    in the loop that has to keep popping buffers. It runs on its own thread and
+    reads a prefix snapshot of the sample lists.
+
+    No lock: the acquisition thread only ever appends, list.append and slicing
+    are atomic under the GIL, and taking the shortest common length gives a
+    consistent prefix even if a frame is half-recorded across the lists.
+    """
+
+    def __init__(self, path, period, series_t, series_c, series_ratio, subtitle):
+        self.path, self.period = path, period
+        self.t, self.c, self.ratio = series_t, series_c, series_ratio
+        self.subtitle = subtitle
+        self.stop = threading.Event()
+        self.errors = 0
+        self.n_drawn = 0
+        self.thread = threading.Thread(target=self._run, daemon=True)
+
+    def snapshot(self):
+        n = min([len(self.t), len(self.ratio)] + [len(y) for y in self.c])
+        return self.t[:n], [y[:n] for y in self.c], self.ratio[:n]
+
+    def draw_now(self):
+        t, c, ratio = self.snapshot()
+        if len(t) < 2:
+            return False
+        # Write and rename: an image viewer watching the file must never catch
+        # a half-written PNG.
+        tmp = self.path.with_name(self.path.name + ".tmp")
+        write_plot(tmp, t, c, ratio, self.subtitle(len(t), t[-1]))
+        os.replace(tmp, self.path)
+        self.n_drawn += 1
+        return True
+
+    def _run(self):
+        while not self.stop.wait(self.period):
+            try:
+                self.draw_now()
+            except Exception:
+                # A live redraw is a convenience; never let it end the capture.
+                self.errors += 1
+
+    def start(self):
+        self.thread.start()
+
+    def finish(self):
+        self.stop.set()
+        self.thread.join(timeout=30)
 
 
 def load_roi_state(path):
@@ -323,6 +386,7 @@ def main(argv=None):
 
     series_t, series_c = [], [[] for _ in range(N_ROIS)]
     series_ratio = []
+    plotter = None
     n_seen = n_written = 0
     n_bad = 0                      # buffers the camera returned with a bad status
     first_id = last_id = None
@@ -338,6 +402,17 @@ def main(argv=None):
                             + [f"contrast_roi{i + 1}" for i in range(N_ROIS)]
                             + [f"mean_roi{i + 1}" for i in range(N_ROIS)]
                             + ["ratio_roi1_roi2", "raw_index"])
+            def subtitle(n, secs):
+                return (f"{n} frames, {n / max(secs, 1e-9):.1f} fps, "
+                        f"{roi_size}px ROIs at {tuple(centers[0])} and "
+                        f"{tuple(centers[1])}, {args.pixel_format}, "
+                        f"{cam.get_exposure_us()} us")
+
+            if not args.no_plot and args.plot_every > 0:
+                plotter = LivePlotter(args.out / "contrast.png", args.plot_every,
+                                      series_t, series_c, series_ratio, subtitle)
+                plotter.start()
+
             deadline = None
             # Wall-clock backstop: the real deadline only starts on the first
             # good frame, so a run that never gets one would otherwise sit here
@@ -394,6 +469,13 @@ def main(argv=None):
                             series_c[i].append(v)
                         series_ratio.append(ratio)
                         n_seen += 1
+                        # Flush every row: the CSV must be complete and readable
+                        # from another process at any moment, and a run killed
+                        # halfway must keep everything measured so far. One
+                        # flush per frame is ~60 syscalls/s, which is nothing.
+                        fh.flush()
+                        if raw_index != "":
+                            raw_file.flush()
                 finally:
                     cam.stream.push_buffer(buf)
 
@@ -408,6 +490,8 @@ def main(argv=None):
     finally:
         c1, f1, u1 = cam.stream_stats()
         cam.stop()
+        if plotter is not None:
+            plotter.finish()
         if raw_file is not None:
             raw_file.close()
 
@@ -431,16 +515,24 @@ def main(argv=None):
         stream_failures=failures, stream_underruns=underruns,
         bad_status_buffers=n_bad, no_frames_dropped=clean), indent=2))
 
+    # One last redraw so the file covers every frame, including those measured
+    # after the final periodic pass.
     plot_path = args.out / "contrast.png"
     if args.no_plot or len(series_t) < 2:
         plot_path = None
     else:
         try:
-            subtitle = (f"{n_seen} frames, {n_seen / max(elapsed, 1e-9):.1f} fps, "
-                        f"{roi_size}px ROIs at {tuple(centers[0])} and "
-                        f"{tuple(centers[1])}, {args.pixel_format}, "
-                        f"{cam.get_exposure_us()} us")
-            write_plot(plot_path, series_t, series_c, series_ratio, subtitle)
+            if plotter is None:
+                plotter = LivePlotter(plot_path, 0, series_t, series_c,
+                                      series_ratio,
+                                      lambda n, secs: (
+                                          f"{n} frames, {n / max(secs, 1e-9):.1f} fps, "
+                                          f"{roi_size}px ROIs at {tuple(centers[0])} "
+                                          f"and {tuple(centers[1])}, "
+                                          f"{args.pixel_format}, "
+                                          f"{cam.get_exposure_us()} us"))
+            if not plotter.draw_now():
+                plot_path = None
         except Exception as exc:
             # Never let a plotting problem be the thing that ends a long run.
             print(f"could not write {plot_path}: {exc}", file=sys.stderr)
@@ -450,7 +542,11 @@ def main(argv=None):
           f"({n_seen / max(elapsed, 1e-9):.1f} fps)")
     print(f"contrast    {csv_path}")
     if plot_path is not None:
-        print(f"plot        {plot_path}")
+        live = (f", redrawn {plotter.n_drawn}x during the run"
+                if plotter is not None and plotter.n_drawn else "")
+        errs = (f", {plotter.errors} redraw error(s)"
+                if plotter is not None and plotter.errors else "")
+        print(f"plot        {plot_path}{live}{errs}")
     if raw_file is not None:
         print(f"raw frames  {n_written} written to {raw_path} "
               f"({raw_path.stat().st_size / 1e9:.2f} GB)")
