@@ -7,6 +7,10 @@ captures_*/
 # Multi-GB; the small contrast.csv and the JSON sidecars stay trackable.
 frames.raw
 
+# Live ROI geometry the viewer keeps in sync with its screen, for
+# capture_timeseries.py to pick up. Per-machine session state, not source.
+roi_state.json
+
 # Python
 __pycache__/
 *.py[cod]

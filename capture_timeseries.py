@@ -24,11 +24,12 @@ Decimation never changes the contrast series: every frame is still popped and
 measured, only the *writing* of raw pixels is skipped. That is also why it costs
 nothing to leave contrast in the hot loop.
 
-Example, taking the ROI positions off the viewer's readout ("at: 300px (row 874,
-col 618)" means --roi1 618,874):
+The ROIs come from the viewer by default: speckle_viewer.py keeps roi_state.json
+matching what is on screen, so place the two ROIs there, leave it running or not,
+and this script measures the same two spots. --roi1/--roi2/--roi-size override it.
 
-    python3 capture_timeseries.py --minutes 5 --roi-size 300 \\
-        --roi1 618,874 --roi2 2154,874 --crop --raw-every 20 --out run_2026-09-10
+    python3 capture_timeseries.py --minutes 5 --crop --raw-every 20 \\
+        --out run_2026-09-10
 
 Read frames.raw back with:
 
@@ -69,7 +70,8 @@ import gi
 gi.require_version("Aravis", "0.8")
 from gi.repository import Aravis
 
-from speckle_viewer import N_ROIS, SpeckleCamera, TILES_PER_AXIS, roi_stats
+from speckle_viewer import (N_ROIS, ROI_STATE_PATH, SpeckleCamera,
+                            TILES_PER_AXIS, roi_stats)
 
 # A far deeper ring than the viewer's 48: this loop must survive a filesystem
 # stall (a flush, a directory sync) without the camera starving. At 200 fps, 256
@@ -98,11 +100,16 @@ def parse_args(argv=None):
 
     p.add_argument("--raw-every", type=int, default=0, metavar="N",
                    help="write one raw frame in N; 0 writes none, 1 writes all")
-    p.add_argument("--roi-size", type=int, default=300, help="ROI side in px")
+    p.add_argument("--roi-size", type=int, help="ROI side in px")
     p.add_argument("--roi1", type=parse_point, metavar="X,Y",
-                   help="ROI 1 centre in sensor px (default: sensor 1/4 width)")
+                   help="ROI 1 centre in sensor px")
     p.add_argument("--roi2", type=parse_point, metavar="X,Y",
-                   help="ROI 2 centre in sensor px (default: sensor 3/4 width)")
+                   help="ROI 2 centre in sensor px")
+    p.add_argument("--roi-state", type=Path, default=ROI_STATE_PATH,
+                   help="ROI geometry saved by the viewer; --roi1/--roi2/"
+                        "--roi-size override whatever it holds")
+    p.add_argument("--no-roi-state", action="store_true",
+                   help="ignore the viewer's file and use the defaults")
     p.add_argument("--crop", action="store_true",
                    help="read out only the box enclosing both ROIs (faster)")
 
@@ -116,6 +123,19 @@ def parse_args(argv=None):
     p.add_argument("--tiles", type=int, default=TILES_PER_AXIS,
                    help="contrast is the mean of NxN per-tile std/mean")
     return p.parse_args(argv)
+
+
+def load_roi_state(path):
+    """The viewer's saved geometry, or None if there is nothing usable there."""
+    try:
+        state = json.loads(Path(path).read_text())
+        centers = [tuple(int(v) for v in c) for c in state["roi_centers_sensor"]]
+        size = int(state["roi_size"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    if len(centers) != N_ROIS:
+        return None
+    return centers, size, state
 
 
 def roi_boxes_in_frame(centers, size, region):
@@ -150,13 +170,30 @@ def main(argv=None):
 
     cam = SpeckleCamera(pixel_format=args.pixel_format, n_buffers=N_BUFFERS)
     sw, sh = cam.sensor_size()
-    centers = [args.roi1 or (sw // 4, sh // 2),
-               args.roi2 or (3 * sw // 4, sh // 2)]
+
+    # Precedence: explicit arguments, then whatever the viewer last had on
+    # screen, then a default spread across the sensor.
+    saved = None if args.no_roi_state else load_roi_state(args.roi_state)
+    if saved is not None:
+        saved_centers, saved_size, saved_state = saved
+        origin = f"viewer state {args.roi_state}"
+        age = time.time() - saved_state.get("saved_at", 0)
+        origin += f" (saved {age / 60:.0f} min ago)" if age > 90 else " (just saved)"
+    else:
+        saved_centers = [(sw // 4, sh // 2), (3 * sw // 4, sh // 2)]
+        saved_size = 300
+        origin = ("--no-roi-state" if args.no_roi_state
+                  else f"defaults ({args.roi_state} not readable)")
+
+    centers = [args.roi1 or saved_centers[0], args.roi2 or saved_centers[1]]
+    roi_size = args.roi_size if args.roi_size is not None else saved_size
+    overridden = [n for n, v in (("--roi1", args.roi1), ("--roi2", args.roi2),
+                                 ("--roi-size", args.roi_size)) if v is not None]
     if len(centers) != N_ROIS:
         raise SystemExit(f"this script measures {N_ROIS} ROIs")
 
     if args.crop:
-        left, top, bw, bh = bounding_box(centers, args.roi_size, (sw, sh))
+        left, top, bw, bh = bounding_box(centers, roi_size, (sw, sh))
         region = cam.set_region_box(left, top, bw, bh)
     else:
         region = cam.set_full_region()
@@ -171,12 +208,15 @@ def main(argv=None):
     target = args.fps if args.fps is not None else cam.frame_rate_bounds()[1]
     fps = cam.set_frame_rate(float(target))
 
-    boxes = roi_boxes_in_frame(centers, args.roi_size, region)
+    boxes = roi_boxes_in_frame(centers, roi_size, region)
     dtype = np.uint8 if args.pixel_format == "Mono8" else np.uint16
     bytes_per_frame = w * h * np.dtype(dtype).itemsize
     raw_rate = bytes_per_frame * fps / args.raw_every if args.raw_every else 0.0
 
     print(cam.description())
+    print(f"ROI source  {origin}")
+    if overridden:
+        print(f"            overridden on the command line: {', '.join(overridden)}")
     print(f"region      {w}x{h} at ({x0}, {y0})   {args.pixel_format}")
     for i, (top, left, size) in enumerate(boxes):
         print(f"ROI {i + 1}       {size}px at frame (row {top}, col {left})"
@@ -299,7 +339,8 @@ def main(argv=None):
                 pixel_format=args.pixel_format)
     (args.out / "frames.json").write_text(json.dumps(meta, indent=2))
     (args.out / "run.json").write_text(json.dumps(dict(
-        meta, roi_centers=[list(c) for c in centers], roi_size=args.roi_size,
+        meta, roi_centers=[list(c) for c in centers], roi_size=roi_size,
+        roi_source=origin,
         roi_boxes=[list(b) for b in boxes], tiles=args.tiles,
         exposure_us=cam.get_exposure_us(), gain_db=cam.get_gain_db(),
         frame_rate=fps, duration_s=elapsed, n_frames=n_seen,

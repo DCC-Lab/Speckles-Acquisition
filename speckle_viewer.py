@@ -42,9 +42,11 @@ if sys.platform == "darwin" and os.environ.get("_ARAVIS_BOOTSTRAP") != "1":
 # -----------------------------------------------------------------------------
 
 import atexit
+import json
 import signal
 import time
 from collections import deque
+from pathlib import Path
 from tkinter import filedialog, ttk
 
 import numpy as np
@@ -87,6 +89,10 @@ ROI_COLORS = [(0, 200, 0), (0, 170, 255)]   # overlay RGB, index-matched to N_RO
                             # The plot derives its line colours from these, so a
                             # curve and its rectangle can never drift apart.
 RATIO_COLOR = "k"           # ROI1/ROI2 contrast ratio: right-hand axis, dashed
+ROI_STATE_PATH = Path(__file__).resolve().parent / "roi_state.json"
+                            # The viewer keeps this file matching what is on
+                            # screen, so capture_timeseries.py can measure the
+                            # same ROIs without anyone copying numbers by hand.
 TILES_PER_AXIS = 5          # ROI is split into this many tiles per axis (N×N);
                             # contrast = mean of each tile's std/mean. Tiling
                             # removes ROI-scale illumination gradients.
@@ -844,6 +850,7 @@ class SpeckleViewerApp(App):
         self._acq_fps = 0.0
         self._acq_drop_rate = 0.0
 
+        self._roi_state = None          # last dict written to ROI_STATE_PATH
         self.camera.start()
         self._install_signal_handlers()
         self.after(SLOW_MS, self.slow_tick)
@@ -949,8 +956,51 @@ class SpeckleViewerApp(App):
             self.plot.ratio_series = (times, ratios, RATIO_COLOR, "ratio 1/2")
             self.plot.update_plot()
 
+        self.save_roi_state()
+
         if self.is_running:
             self.after(SLOW_MS, self.slow_tick)
+
+    def save_roi_state(self):
+        """Keep ROI_STATE_PATH matching what is on screen, whenever it changes.
+
+        Driven from slow_tick rather than from each control's callback: that
+        catches every way the geometry can move -- a click, an edit to the size
+        field, Center ROI, engaging or releasing the hardware ROI -- without
+        hooking each one, and it cannot fall out of date.
+
+        Centres are stored in SENSOR pixels. The view holds them in frame
+        pixels, which mean nothing without the region they belong to, so a
+        cropped session would otherwise write coordinates no one else can read.
+        """
+        if any(c is None for c in self.view.roi_centers):
+            return                          # nothing placed yet: first frame pending
+        try:
+            x0, y0, w, h = self.camera.get_region()
+            state = dict(
+                roi_size=int(self.roi_size_control.value),
+                roi_centers_sensor=[[int(cx) + x0, int(cy) + y0]
+                                    for cx, cy in self.view.roi_centers],
+                region=[x0, y0, w, h],
+                hardware_roi=bool(self.view.hardware_roi),
+                pixel_format=self.camera.pixel_format,
+                exposure_us=int(self.camera.get_exposure_us()),
+                gain_db=float(self.camera.get_gain_db()),
+                frame_rate=float(self.camera.get_frame_rate()),
+                tiles=TILES_PER_AXIS,
+            )
+        except Exception:
+            return
+        if state == self._roi_state:
+            return                          # unchanged: no write, no disk churn
+        try:
+            # Write and rename: a reader must never catch a half-written file.
+            tmp = ROI_STATE_PATH.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(dict(state, saved_at=time.time()), indent=2))
+            os.replace(tmp, ROI_STATE_PATH)
+            self._roi_state = state
+        except OSError as exc:
+            print(f"Could not write {ROI_STATE_PATH}: {exc}")
 
     def toggle_run(self, event, button):
         if self.camera.is_running:
