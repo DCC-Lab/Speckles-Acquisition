@@ -851,9 +851,28 @@ class SpeckleViewerApp(App):
         self._acq_drop_rate = 0.0
 
         self._roi_state = None          # last dict written to ROI_STATE_PATH
+        self._restore_roi_state()
         self.camera.start()
         self._install_signal_handlers()
         self.after(SLOW_MS, self.slow_tick)
+
+    def _restore_roi_state(self):
+        """Restore the last saved ROI geometry, if it is usable."""
+        try:
+            state = json.loads(ROI_STATE_PATH.read_text())
+            centers = [tuple(int(v) for v in c)
+                       for c in state["roi_centers_sensor"]]
+            size = int(state["roi_size"])
+            if len(centers) != N_ROIS:
+                return
+            x0, y0, w, h = (int(v) for v in self.camera.get_region())
+            size = int(np.clip(size, 8, min(w, h)))
+            self.roi_size_control.value = size
+            self.view.roi_centers = [(cx - x0, cy - y0)
+                                     for cx, cy in centers]
+            self._roi_state = None
+        except (OSError, ValueError, KeyError, TypeError):
+            return
 
     # -- callbacks -------------------------------------------------------------
     def on_stats(self, stats):
