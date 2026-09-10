@@ -235,10 +235,58 @@ class SpeckleCamera:
         w, h = self.camera.get_sensor_size()
         return int(w), int(h)
 
+    def get_region(self):
+        """Current readout box as (x, y, width, height) in sensor pixels."""
+        return tuple(int(v) for v in self.camera.get_region())
+
     @staticmethod
     def _snap(value, inc, lo, hi):
         snapped = int(round(value / inc)) * inc
         return int(max(lo, min(hi, snapped)))
+
+    @staticmethod
+    def _snap_down(value, inc, lo, hi):
+        return int(max(lo, min(hi, (int(value) // inc) * inc)))
+
+    @staticmethod
+    def _snap_up(value, inc, lo, hi):
+        return int(max(lo, min(hi, -(-int(value) // inc) * inc)))
+
+    def set_region_box(self, left, top, width, height):
+        """Read out exactly the box (left, top, width, height), in sensor px.
+
+        Unlike set_roi_region, which centres a size on a point and snaps to the
+        nearest increment, this snaps offsets *down* and sizes *up*: the readout
+        is then guaranteed to contain the requested box rather than shave a few
+        pixels off its edge. That matters when the box is the bounding box of
+        the ROIs -- clipping it would silently move a ROI.
+        """
+        was = self.is_running
+        if was:
+            self.stop()
+        cam = self.camera
+        # Reset offset to 0 so the width/height maxima reflect the full sensor.
+        _, _, w0, h0 = cam.get_region()
+        cam.set_region(0, 0, w0, h0)
+
+        # Snap the offset down FIRST, then size from there to the requested far
+        # edge. Sizing from the un-snapped offset would leave the box short by
+        # however far the offset moved, shaving pixels off the right/bottom.
+        xinc, yinc = cam.get_x_offset_increment(), cam.get_y_offset_increment()
+        x = max(0, (int(left) // xinc) * xinc)
+        y = max(0, (int(top) // yinc) * yinc)
+        w = self._snap_up(int(left) + int(width) - x,
+                          cam.get_width_increment(), *cam.get_width_bounds())
+        h = self._snap_up(int(top) + int(height) - y,
+                          cam.get_height_increment(), *cam.get_height_bounds())
+
+        cam.set_region(0, 0, w, h)   # size first -> offset bounds become valid
+        x = self._snap_down(x, xinc, *cam.get_x_offset_bounds())
+        y = self._snap_down(y, yinc, *cam.get_y_offset_bounds())
+        cam.set_region(x, y, w, h)
+        if was:
+            self.start()
+        return cam.get_region()
 
     def set_full_region(self):
         """Read out the full sensor. Restarts the stream if it was running."""
@@ -459,6 +507,21 @@ class CameraView(Base):
         frame pixels, and a crop changes what a frame pixel means.
         """
         self.roi_centers = [None] * N_ROIS
+
+    def roi_boxes(self, shape):
+        """(top, left, size) of every ROI for a frame of `shape` = (h, w)."""
+        h, w = shape
+        return [self._roi_box(h, w, i) for i in range(N_ROIS)]
+
+    def shift_roi_centers(self, dx, dy):
+        """Translate placed ROI centres, e.g. after the readout origin moved.
+
+        Centres are frame pixels; moving the crop changes where frame (0, 0)
+        sits on the sensor, so they have to be re-expressed to keep each ROI on
+        the same physical spot.
+        """
+        self.roi_centers = [None if c is None else (c[0] + dx, c[1] + dy)
+                            for c in self.roi_centers]
 
     def _roi_box(self, h, w, index):
         """(top, left, size) of ROI `index`, clipped inside an h x w frame.
@@ -921,20 +984,29 @@ class SpeckleViewerApp(App):
             self.bg_label.text = "background: capture one first!"
 
     def toggle_hardware_roi(self, checkbox):
+        # ROI centres are frame pixels, so note where the current frame sits on
+        # the sensor before the region moves under them.
+        x0, y0, fw, fh = self.camera.get_region()
+
         if bool(checkbox.value):
-            sw, sh = self.camera.sensor_size()
-            # Engaged from a full-frame readout, so ROI 1's centre is in sensor
-            # pixels here. Give the crop some room: the two software ROIs have
-            # to fit side by side inside it.
-            cx, cy = self.view.roi_centers[0] or (sw // 2, sh // 2)
-            one = int(self.roi_size_control.value)
-            # A strip N ROIs wide but only one ROI tall: enough room to lay them
-            # out side by side, without paying N^2 pixels for it.
-            region = self.camera.set_roi_region(cx, cy, one * N_ROIS, height=one)
+            # Crop to the bounding box of the ROIs: read out just enough sensor
+            # to cover both of them, wherever the user has put them.
+            boxes = self.view.roi_boxes((fh, fw))
+            left = min(b[1] for b in boxes)
+            top = min(b[0] for b in boxes)
+            right = max(b[1] + b[2] for b in boxes)
+            bottom = max(b[0] + b[2] for b in boxes)
+            region = self.camera.set_region_box(x0 + left, y0 + top,
+                                                right - left, bottom - top)
             self.view.hardware_roi = True
         else:
             region = self.camera.set_full_region()
             self.view.hardware_roi = False
+
+        # Re-express the centres against the new readout origin so both ROIs
+        # stay on the same physical spot instead of jumping.
+        x1, y1 = int(region[0]), int(region[1])
+        self.view.shift_roi_centers(x0 - x1, y0 - y1)
 
         # A region change moves the achievable frame-rate ceiling, but the camera
         # keeps running at the previously pinned AcquisitionFrameRate until a new
@@ -952,10 +1024,8 @@ class SpeckleViewerApp(App):
             print(f"Could not re-apply frame rate after ROI change: {exc}")
 
         # Region change resizes the frame, so any captured background no longer
-        # fits -- and the stored ROI centres are frame pixels, which a crop
-        # redefines. Drop both so they land inside the new frame.
+        # fits. (The ROI centres were re-expressed above, not dropped.)
         self.view.background = None
-        self.view.reset_roi_centers()
         x, y, w, h = region
         self.bg_label.text = f"background: re-capture (region now {w}×{h} @ {x},{y})"
 
