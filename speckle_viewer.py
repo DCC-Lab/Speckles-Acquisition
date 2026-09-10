@@ -67,7 +67,10 @@ N_STREAM_BUFFERS = 48       # ring of buffers cycled through the stream. The
                             # ~1000 fps (tiny ROI) that's ~30, so 48 leaves
                             # margin. Costs ~N x payload of RAM (Mono16 full
                             # frame ~3 MB each), allocated up front in start().
-DISPLAY_MAX_WIDTH = 820     # on-screen image width (px); frame is subsampled to fit
+DISPLAY_MAX_WIDTH = 820     # on-screen image width (px). The display box is a
+                            # FIXED size (this width x the sensor aspect ratio);
+                            # every frame is scaled to fit inside it, so changing
+                            # the ROI never resizes the widget or the window.
 DEFAULT_ROI_SIZE = 300
 DEFAULT_EXPOSURE_US = 500
 REFRESH_MS = 30             # display refresh period
@@ -380,7 +383,15 @@ class CameraView(Base):
         self.stretch = True                        # auto-stretch display brightness
         self._tkimage = None
         self._scheduled = None
-        self._step = 1                             # display subsample factor
+        # Fixed on-screen box, sized once from the full sensor so a full-frame
+        # readout fills it exactly. Frames are scaled to fit inside it.
+        sw, sh = camera.sensor_size()
+        self._canvas_w = int(DISPLAY_MAX_WIDTH)
+        self._canvas_h = max(1, round(DISPLAY_MAX_WIDTH * sh / sw))
+        # Frame -> canvas mapping (x_canvas = x_frame * k + ox), kept for clicks.
+        self._k = 1.0
+        self._origin = (0, 0)
+        self._frame_shape = None                   # (h, w) of the last rendered frame
         self._frame_times = deque(maxlen=30)
         self.fps = 0.0
         self.dt_mean_ms = 0.0
@@ -393,6 +404,11 @@ class CameraView(Base):
 
     def create_widget(self, master):
         self.widget = ttk.Label(master, borderwidth=2, relief="groove")
+        # Blank image at the final size: the label is sized by its image, so
+        # this stops it from growing when the first frame lands.
+        self._tkimage = ImageTk.PhotoImage(
+            Image.new("RGB", (self._canvas_w, self._canvas_h), (0, 0, 0)))
+        self.widget.configure(image=self._tkimage)
         self.widget.bind("<Button-1>", self._on_click)
         self._scheduled = App.app.root.after(REFRESH_MS, self.update_display)
 
@@ -411,8 +427,17 @@ class CameraView(Base):
         return top, left, size
 
     def _on_click(self, event):
-        if self._step:
-            self.roi_center = (event.x * self._step, event.y * self._step)
+        """Map a click on the (scaled, centred) display back to frame pixels."""
+        # Use the shape recorded by the last _render: latest_frame() drains the
+        # stream and returns None when no new buffer is ready, so calling it
+        # here would drop most clicks and steal frames from the display loop.
+        if not self._k or self._frame_shape is None:
+            return
+        ox, oy = self._origin
+        h, w = self._frame_shape
+        cx = int(np.clip((event.x - ox) / self._k, 0, w - 1))
+        cy = int(np.clip((event.y - oy) / self._k, 0, h - 1))
+        self.roi_center = (cx, cy)
 
     def capture_background(self, n=16):
         """Begin averaging n frames into a background frame. Block the beam first."""
@@ -442,6 +467,7 @@ class CameraView(Base):
 
     def _render(self, frame):
         h, w = frame.shape
+        self._frame_shape = (h, w)
         top, left, size = self._roi_box(h, w)
 
         bg_on = (self.subtract_bg and self.background is not None
@@ -454,13 +480,15 @@ class CameraView(Base):
         if self.stats_callback:
             self.stats_callback(stats)
 
-        # Subsample for display (fast, keeps the grainy speckle look).
-        step = max(1, w // DISPLAY_MAX_WIDTH)
-        self._step = step
+        # Cheap integer subsample first: it costs nothing and keeps the resize
+        # below working on a small array. Never subsamples past the canvas size.
+        step = max(1, w // self._canvas_w, h // self._canvas_h)
         small = work[::step, ::step].astype(np.float64)
         if bg_on:
             small = np.clip(small, 0, None)
 
+        # Stretch on the subsampled frame, BEFORE padding: percentiles taken
+        # over the black margins would wash out a small ROI.
         if self.stretch:
             lo, hi = np.percentile(small, [0.5, 99.5])
             if hi <= lo:
@@ -468,14 +496,34 @@ class CameraView(Base):
         else:
             lo, hi = 0, self.camera.sat_level
         disp = np.clip((small - lo) / (hi - lo) * 255, 0, 255)
-        img = Image.fromarray(disp.astype(np.uint8), mode="L").convert("RGB")
+        img = Image.fromarray(disp.astype(np.uint8)).convert("RGB")
 
-        draw = ImageDraw.Draw(img)
+        # Scale to fit the fixed canvas, preserving aspect ratio, and centre it.
+        # NEAREST on purpose: interpolation would smooth the speckle grain and
+        # make the acf1 grain-size gauge lie about what the sensor sees.
+        sh_, sw_ = small.shape
+        scale = min(self._canvas_w / sw_, self._canvas_h / sh_)
+        new_w = max(1, round(sw_ * scale))
+        new_h = max(1, round(sh_ * scale))
+        img = img.resize((new_w, new_h), Image.NEAREST)
+
+        canvas = Image.new("RGB", (self._canvas_w, self._canvas_h), (0, 0, 0))
+        ox = (self._canvas_w - new_w) // 2
+        oy = (self._canvas_h - new_h) // 2
+        canvas.paste(img, (ox, oy))
+
+        # frame pixels -> canvas pixels, for the overlay and for _on_click.
+        k = scale / step
+        self._k = k
+        self._origin = (ox, oy)
+
+        draw = ImageDraw.Draw(canvas)
         draw.rectangle(
-            [left // step, top // step, (left + size) // step, (top + size) // step],
+            [round(left * k) + ox, round(top * k) + oy,
+             round((left + size) * k) + ox, round((top + size) * k) + oy],
             outline=(0, 255, 0), width=2,
         )
-        self._tkimage = ImageTk.PhotoImage(img)
+        self._tkimage = ImageTk.PhotoImage(canvas)
         self.widget.configure(image=self._tkimage)
 
 
@@ -504,19 +552,19 @@ class SpeckleViewerApp(App):
         self.camera = SpeckleCamera()
         exp_lo, exp_hi = self.camera.exposure_bounds_us()
 
-        # --- image (left) -----------------------------------------------------
+        # --- controls (left) --------------------------------------------------
+        self.controls = Box(label="Controls")
+        self.controls.grid_into(self.window, row=0, column=0, padx=10, pady=10,
+                                sticky="nsew")
+
+        # --- image (right) ----------------------------------------------------
         self.view = CameraView(
             self.camera,
             roi_size_getter=lambda: self.roi_size_control.value,
             stats_callback=self.on_stats,
         )
-        self.view.grid_into(self.window, row=0, column=0, padx=10, pady=10,
+        self.view.grid_into(self.window, row=0, column=1, padx=10, pady=10,
                             sticky="nw")
-
-        # --- controls (right) -------------------------------------------------
-        self.controls = Box(label="Controls")
-        self.controls.grid_into(self.window, row=0, column=1, padx=10, pady=10,
-                                sticky="nsew")
 
         self.start_button = Button("Stop", user_event_callback=self.toggle_run)
         self.start_button.grid_into(self.controls, row=0, column=0, padx=8, pady=6,
