@@ -1,7 +1,7 @@
 # LSCI theory notes for this workspace
 
 Physics framework underlying the exposure-sweep and milk-coagulation
-experiments. Companion to `SESSION_NOTES.md`.
+experiments. Companion to `INSTALL-Old mac intel.md`.
 
 ## 1. The LSCI contrast model
 

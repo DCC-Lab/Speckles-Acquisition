@@ -27,7 +27,7 @@ import os
 import sys
 
 if sys.platform == "darwin" and os.environ.get("_ARAVIS_BOOTSTRAP") != "1":
-    brew = "/opt/homebrew"
+    brew = "/opt/homebrew" if os.uname().machine == "arm64" else "/usr/local"
     pyver = f"python{sys.version_info.major}.{sys.version_info.minor}"
     extra = {
         "DYLD_FALLBACK_LIBRARY_PATH": f"{brew}/lib",

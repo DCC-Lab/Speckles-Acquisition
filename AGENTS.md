@@ -97,7 +97,7 @@ Because vibration rigidly shifts the whole speckle pattern between frames (which
 
 ### Docs & data
 - **`LSCI_THEORY.md`** — the physics: contrast models, decorrelation, fitting. Read this to understand *why* the code does what it does.
-- **`SESSION_NOTES.md`** — running log of real experiment sessions, settings and findings. **Check this first when resuming** — it's the lab notebook.
+- **`INSTALL-Old mac intel.md`** — running log of real experiment sessions, settings and findings. **Check this first when resuming** — it's the lab notebook.
 - **`*_decorrelation_data/`, `paper_*_data/`, `milk_*_data/`** — saved datasets, each with CSVs + PNGs + a small `README.md`.
 - **`contrast_*.csv`** — analysis outputs from past runs.
 
@@ -119,7 +119,7 @@ Because vibration rigidly shifts the whole speckle pattern between frames (which
 4. To *fit*: `python3 fit_decorrelation.py` (reads the newest CSVs).
 5. To *reprocess old PNG captures*: set `CAPTURES`/`FIXED_ROI` in `analyze_sweep.py` and run it.
 6. Before trusting a short-exposure result, sanity-check against `characterize_background.py` (light OFF) — the background can fake decorrelation.
-7. When resuming someone else's work, read `SESSION_NOTES.md` and `LSCI_THEORY.md` first.
+7. When resuming someone else's work, read `INSTALL-Old mac intel.md` and `LSCI_THEORY.md` first.
 
 ## 8. Conventions when editing
 
