@@ -10,6 +10,7 @@ different loop -- this one, which pops every buffer and never skips.
 What it writes into --out:
 
     contrast.csv    one row per frame: time, frame_id, contrast per ROI, ratio
+    contrast.png    both contrasts and their ratio against time
     frames.raw      raw sensor frames, appended back to back (optional)
     frames.json     shape/dtype/region/decimation, so frames.raw can be read back
     run.json        the full settings and the drop audit for the run
@@ -70,8 +71,8 @@ import gi
 gi.require_version("Aravis", "0.8")
 from gi.repository import Aravis
 
-from speckle_viewer import (N_ROIS, ROI_STATE_PATH, SpeckleCamera,
-                            TILES_PER_AXIS, roi_stats)
+from speckle_viewer import (N_ROIS, RATIO_COLOR, ROI_COLORS, ROI_STATE_PATH,
+                            SpeckleCamera, TILES_PER_AXIS, _hex, roi_stats)
 
 # A far deeper ring than the viewer's 48: this loop must survive a filesystem
 # stall (a flush, a directory sync) without the camera starving. At 200 fps, 256
@@ -122,7 +123,82 @@ def parse_args(argv=None):
                         "achievable rate on the same link")
     p.add_argument("--tiles", type=int, default=TILES_PER_AXIS,
                    help="contrast is the mean of NxN per-tile std/mean")
+    p.add_argument("--no-plot", action="store_true",
+                   help="skip contrast.png at the end of the run")
     return p.parse_args(argv)
+
+
+def write_plot(path, t, contrasts, ratio, subtitle):
+    """Contrasts in the top panel, their ratio in the bottom one, shared x axis.
+
+    Deliberately not the GUI's twin-axis layout. On a twin axis the ratio's own
+    scale makes it sweep right through the band between the two contrast curves,
+    which reads as the ratio crossing them; it never does. The GUI accepts that
+    because its plot is tiny. Here there is room to separate them, so the panels
+    are stacked and each keeps an honest scale.
+
+    Colours come from speckle_viewer, so a curve here means the same ROI as the
+    rectangle of that colour in the GUI.
+
+    matplotlib is imported here, not at module scope: a capture must never fail
+    at the finish line because plotting is unavailable.
+    """
+    import matplotlib
+    matplotlib.use("Agg")                    # no display: this runs headless
+    import matplotlib.pyplot as plt
+
+    t = np.asarray(t, float)
+    # Frame-to-frame contrast noise buries the trend on a long run. Keep every
+    # sample visible but lay a rolling mean, ~1% of the run, over it.
+    window = max(5, len(t) // 100) if len(t) > 1000 else 1
+    smooth_t = t[window - 1:] if window > 1 else t
+
+    def smooth(y):
+        # np.convolve propagates NaN across the whole window, so a single NaN
+        # ratio sample would erase a stretch of the mean. Interpolate first.
+        y = np.asarray(y, float)
+        bad = ~np.isfinite(y)
+        if bad.all():
+            return np.full(len(smooth_t), np.nan)
+        if bad.any():
+            y = y.copy()
+            y[bad] = np.interp(np.flatnonzero(bad), np.flatnonzero(~bad), y[~bad])
+        return np.convolve(y, np.ones(window) / window, mode="valid")
+
+    # constrained layout, not tight_layout: the latter warns and mislays the
+    # panels when the gridspec carries an explicit hspace.
+    fig, (ax, rax) = plt.subplots(
+        2, 1, figsize=(11, 6.5), sharex=True, layout="constrained",
+        gridspec_kw=dict(height_ratios=[2, 1]))
+
+    for i, y in enumerate(contrasts):
+        color = _hex(ROI_COLORS[i])
+        ax.plot(t, y, "-", color=color, lw=0.7,
+                alpha=0.3 if window > 1 else 1.0,
+                label=None if window > 1 else f"ROI {i + 1}")
+        if window > 1:
+            ax.plot(smooth_t, smooth(y), "-", color=color, lw=1.6,
+                    label=f"ROI {i + 1}")
+
+    rax.plot(t, ratio, "-", color=RATIO_COLOR, lw=0.7,
+             alpha=0.3 if window > 1 else 1.0)
+    if window > 1:
+        rax.plot(smooth_t, smooth(ratio), "-", color=RATIO_COLOR, lw=1.4)
+
+    ax.set_ylabel("speckle contrast  σ/⟨I⟩")
+    ax.legend(loc="best", fontsize="small", framealpha=0.8)
+    ax.grid(alpha=0.25)
+    rax.set_ylabel("ratio ROI 1 / ROI 2")
+    rax.set_xlabel("time (s)")
+    rax.grid(alpha=0.25)
+    rax.set_xlim(t[0], t[-1])
+
+    smoothed = (f"thin: every frame,  thick: {window}-frame rolling mean"
+                if window > 1 else "every frame")
+    ax.set_title(f"Speckle contrast time series  ({smoothed})\n{subtitle}",
+                 fontsize=10)
+    fig.savefig(path, dpi=130)
+    plt.close(fig)
 
 
 def load_roi_state(path):
@@ -245,6 +321,8 @@ def main(argv=None):
     csv_path = args.out / "contrast.csv"
     raw_file = open(raw_path, "wb") if args.raw_every else None
 
+    series_t, series_c = [], [[] for _ in range(N_ROIS)]
+    series_ratio = []
     n_seen = n_written = 0
     n_bad = 0                      # buffers the camera returned with a bad status
     first_id = last_id = None
@@ -311,6 +389,10 @@ def main(argv=None):
                                         + [f"{v:.6f}" for v in c]
                                         + [f"{s['mean']:.2f}" for s in stats]
                                         + [f"{ratio:.6f}", raw_index])
+                        series_t.append(now - t_start)
+                        for i, v in enumerate(c):
+                            series_c[i].append(v)
+                        series_ratio.append(ratio)
                         n_seen += 1
                 finally:
                     cam.stream.push_buffer(buf)
@@ -349,9 +431,26 @@ def main(argv=None):
         stream_failures=failures, stream_underruns=underruns,
         bad_status_buffers=n_bad, no_frames_dropped=clean), indent=2))
 
+    plot_path = args.out / "contrast.png"
+    if args.no_plot or len(series_t) < 2:
+        plot_path = None
+    else:
+        try:
+            subtitle = (f"{n_seen} frames, {n_seen / max(elapsed, 1e-9):.1f} fps, "
+                        f"{roi_size}px ROIs at {tuple(centers[0])} and "
+                        f"{tuple(centers[1])}, {args.pixel_format}, "
+                        f"{cam.get_exposure_us()} us")
+            write_plot(plot_path, series_t, series_c, series_ratio, subtitle)
+        except Exception as exc:
+            # Never let a plotting problem be the thing that ends a long run.
+            print(f"could not write {plot_path}: {exc}", file=sys.stderr)
+            plot_path = None
+
     print(f"\n\n{n_seen} frames in {elapsed:.1f}s "
           f"({n_seen / max(elapsed, 1e-9):.1f} fps)")
     print(f"contrast    {csv_path}")
+    if plot_path is not None:
+        print(f"plot        {plot_path}")
     if raw_file is not None:
         print(f"raw frames  {n_written} written to {raw_path} "
               f"({raw_path.stat().st_size / 1e9:.2f} GB)")
