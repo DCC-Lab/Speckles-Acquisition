@@ -1,19 +1,23 @@
 #!/usr/bin/env python3
 """
-Live speckle viewer with real-time contrast in a ROI.
+Live speckle viewer with real-time contrast in two ROIs.
 
 A minimal image viewer for an Aravis/GenICam camera (e.g. FLIR Blackfly S):
-streams frames continuously, lets you click to position a square ROI, and
-reports the speckle contrast (std/mean) of that ROI in real time.
+streams frames continuously, lets you click to position two square ROIs, and
+reports the speckle contrast (std/mean) of each one in real time, both traced
+together on the rolling plot.
 
 UI is built with mytk (https://github.com/DCC-Lab/myTk); camera I/O is Aravis.
 
 Run:
     python3 speckle_viewer.py
 
-Click on the image to move the ROI. Use the controls to change ROI size and
-exposure. "Grain acf1" is the lag-1 horizontal autocorrelation of the ROI -- a
-quick speckle-grain-size gauge: ~0 means grains ~1 px (undersampled, contrast
+Click on the image to move ROI 1, shift-click to move ROI 2; they share the
+one "ROI size" setting. Each ROI has its own colour -- green and cyan -- used
+for both its rectangle and its curve on the plot.
+
+"Grain acf1" is the lag-1 horizontal autocorrelation of the ROI -- a quick
+speckle-grain-size gauge: ~0 means grains ~1 px (undersampled, contrast
 suppressed), ~0.5 means grains ~2 px (well sampled). Stop down the imaging
 aperture to grow the grains until acf1 ~ 0.5.
 """
@@ -37,6 +41,8 @@ if sys.platform == "darwin" and os.environ.get("_ARAVIS_BOOTSTRAP") != "1":
     os.execve(sys.executable, [sys.executable, *sys.argv], env)
 # -----------------------------------------------------------------------------
 
+import atexit
+import signal
 import time
 from collections import deque
 from tkinter import filedialog, ttk
@@ -76,6 +82,11 @@ DEFAULT_EXPOSURE_US = 500
 REFRESH_MS = 30             # display refresh period
 SLOW_MS = 250               # period for plot redraw + applying exposure changes
 PLOT_HISTORY_S = 3          # rolling contrast-plot window (seconds)
+N_ROIS = 2                  # independent ROIs measured side by side
+ROI_COLORS = [(0, 200, 0), (0, 170, 255)]   # overlay RGB, index-matched to N_ROIS.
+                            # The plot derives its line colours from these, so a
+                            # curve and its rectangle can never drift apart.
+RATIO_COLOR = "k"           # ROI1/ROI2 contrast ratio: right-hand axis, dashed
 TILES_PER_AXIS = 5          # ROI is split into this many tiles per axis (N×N);
                             # contrast = mean of each tile's std/mean. Tiling
                             # removes ROI-scale illumination gradients.
@@ -101,6 +112,18 @@ class SpeckleCamera:
 
         # Saturation level in the native dtype (Mono8 -> 255, Mono16 -> ~ceiling).
         self.sat_level = 255 if self._is_mono8() else 65000
+
+        # A camera left acquiring is what breaks the *next* launch: it refuses a
+        # PixelFormat write while streaming, with a misleading "access-denied".
+        # Cover every interpreter exit, including an unhandled exception.
+        atexit.register(self._stop_quietly)
+
+    def _stop_quietly(self):
+        """stop() that never raises -- safe at interpreter teardown."""
+        try:
+            self.stop()
+        except Exception:
+            pass
 
     def _is_mono8(self):
         return self.pixel_format == "Mono8"
@@ -233,8 +256,12 @@ class SpeckleCamera:
             self.start()
         return cam.get_region()
 
-    def set_roi_region(self, cx, cy, size):
-        """Read out only a ~`size` square centred near (cx, cy) in sensor pixels.
+    def set_roi_region(self, cx, cy, size, height=None):
+        """Read out a ~`size` x ~`height` box centred near (cx, cy), in sensor px.
+
+        `height` defaults to `size` (a square). Keeping it separate matters for
+        the multi-ROI layout: a strip wide enough for N ROIs side by side reads
+        out N x the pixels of one, not N^2, so the frame-rate gain survives.
 
         Width/height/offset are snapped to the sensor's increment rules (the
         offset bounds are only valid once the size is set, so we set size first).
@@ -248,7 +275,8 @@ class SpeckleCamera:
         _, _, w0, h0 = cam.get_region()
         cam.set_region(0, 0, w0, h0)
         w = self._snap(size, cam.get_width_increment(), *cam.get_width_bounds())
-        h = self._snap(size, cam.get_height_increment(), *cam.get_height_bounds())
+        h = self._snap(size if height is None else height,
+                       cam.get_height_increment(), *cam.get_height_bounds())
         cam.set_region(0, 0, w, h)   # set size first -> offset bounds become valid
         x = self._snap(cx - w // 2, cam.get_x_offset_increment(),
                        *cam.get_x_offset_bounds())
@@ -377,9 +405,11 @@ class CameraView(Base):
         super().__init__()
         self.camera = camera
         self.roi_size_getter = roi_size_getter   # callable -> int
-        self.stats_callback = stats_callback      # callable(stats_dict)
-        self.roi_center = None                     # (cx, cy) in full-res coords
-        self.hardware_roi = False                  # if True, analyze the whole readout
+        self.stats_callback = stats_callback      # callable(list of stats_dict)
+        # One (cx, cy) per ROI, in *frame* pixels. None = not placed yet, so the
+        # next render drops it at its default spot for the current frame size.
+        self.roi_centers = [None] * N_ROIS
+        self.hardware_roi = False                  # True while the sensor readout is cropped
         self.stretch = True                        # auto-stretch display brightness
         self._tkimage = None
         self._scheduled = None
@@ -409,25 +439,42 @@ class CameraView(Base):
         self._tkimage = ImageTk.PhotoImage(
             Image.new("RGB", (self._canvas_w, self._canvas_h), (0, 0, 0)))
         self.widget.configure(image=self._tkimage)
-        self.widget.bind("<Button-1>", self._on_click)
+        # Plain click moves ROI 1, shift-click moves ROI 2. Binding the two
+        # sequences separately lets Tk dispatch on specificity, which is more
+        # portable than decoding the modifier bits out of event.state.
+        self.widget.bind("<Button-1>", lambda e: self._on_click(e, 0))
+        self.widget.bind("<Shift-Button-1>", lambda e: self._on_click(e, 1))
         self._scheduled = App.app.root.after(REFRESH_MS, self.update_display)
 
     # -- ROI geometry ----------------------------------------------------------
-    def _roi_box(self, h, w):
-        if self.hardware_roi:
-            # The readout already *is* the ROI; analyze the whole (square) frame.
-            s = min(h, w)
-            return 0, 0, s
+    def _default_center(self, index, h, w):
+        """Spread the ROIs evenly across the frame width, on the mid line."""
+        return ((2 * index + 1) * w // (2 * N_ROIS), h // 2)
+
+    def reset_roi_centers(self):
+        """Forget ROI placement; the next render re-drops them for the frame.
+
+        Called whenever the sensor region changes: the stored centres are in
+        frame pixels, and a crop changes what a frame pixel means.
+        """
+        self.roi_centers = [None] * N_ROIS
+
+    def _roi_box(self, h, w, index):
+        """(top, left, size) of ROI `index`, clipped inside an h x w frame.
+
+        Both ROIs are plain software boxes, including while a hardware ROI is
+        engaged -- the cropped readout is just a smaller frame to place them in.
+        """
         size = int(np.clip(self.roi_size_getter(), 8, min(h, w)))
-        if self.roi_center is None:
-            self.roi_center = (w // 2, h // 2)
-        cx, cy = self.roi_center
+        if self.roi_centers[index] is None:
+            self.roi_centers[index] = self._default_center(index, h, w)
+        cx, cy = self.roi_centers[index]
         left = int(np.clip(cx - size // 2, 0, w - size))
         top = int(np.clip(cy - size // 2, 0, h - size))
         return top, left, size
 
-    def _on_click(self, event):
-        """Map a click on the (scaled, centred) display back to frame pixels."""
+    def _on_click(self, event, index=0):
+        """Move ROI `index` to the click, mapping display pixels to frame pixels."""
         # Use the shape recorded by the last _render: latest_frame() drains the
         # stream and returns None when no new buffer is ready, so calling it
         # here would drop most clicks and steal frames from the display loop.
@@ -437,7 +484,7 @@ class CameraView(Base):
         h, w = self._frame_shape
         cx = int(np.clip((event.x - ox) / self._k, 0, w - 1))
         cy = int(np.clip((event.y - oy) / self._k, 0, h - 1))
-        self.roi_center = (cx, cy)
+        self.roi_centers[index] = (cx, cy)
 
     def capture_background(self, n=16):
         """Begin averaging n frames into a background frame. Block the beam first."""
@@ -468,17 +515,22 @@ class CameraView(Base):
     def _render(self, frame):
         h, w = frame.shape
         self._frame_shape = (h, w)
-        top, left, size = self._roi_box(h, w)
-
         bg_on = (self.subtract_bg and self.background is not None
                  and self.background.shape == frame.shape)
         work = (frame.astype(np.float64) - self.background) if bg_on else frame
 
-        stats = roi_stats(work, top, left, size, self.camera.sat_level, raw=frame)
-        stats.update(roi=(top, left, size), fps=self.fps, bg_subtracted=bg_on,
-                     dt_mean_ms=self.dt_mean_ms, dt_std_ms=self.dt_std_ms)
+        # One reduction per ROI. Two 300px ROIs is a negligible cost next to the
+        # resize below; the shared display work is done once, further down.
+        boxes = [self._roi_box(h, w, i) for i in range(N_ROIS)]
+        all_stats = []
+        for i, (top, left, size) in enumerate(boxes):
+            st = roi_stats(work, top, left, size, self.camera.sat_level, raw=frame)
+            st.update(index=i, roi=(top, left, size), fps=self.fps,
+                      bg_subtracted=bg_on, dt_mean_ms=self.dt_mean_ms,
+                      dt_std_ms=self.dt_std_ms)
+            all_stats.append(st)
         if self.stats_callback:
-            self.stats_callback(stats)
+            self.stats_callback(all_stats)
 
         # Cheap integer subsample first: it costs nothing and keeps the resize
         # below working on a small array. Never subsamples past the canvas size.
@@ -518,27 +570,65 @@ class CameraView(Base):
         self._origin = (ox, oy)
 
         draw = ImageDraw.Draw(canvas)
-        draw.rectangle(
-            [round(left * k) + ox, round(top * k) + oy,
-             round((left + size) * k) + ox, round((top + size) * k) + oy],
-            outline=(0, 255, 0), width=2,
-        )
+        for i, (top, left, size) in enumerate(boxes):
+            x0, y0 = round(left * k) + ox, round(top * k) + oy
+            x1, y1 = round((left + size) * k) + ox, round((top + size) * k) + oy
+            draw.rectangle([x0, y0, x1, y1], outline=ROI_COLORS[i], width=2)
+            draw.text((x0 + 4, y0 + 2), str(i + 1), fill=ROI_COLORS[i])
         self._tkimage = ImageTk.PhotoImage(canvas)
         self.widget.configure(image=self._tkimage)
 
 
-class ContrastPlot(XYPlot):
-    """XYPlot whose y-axis tick labels show 2 decimals.
+def _hex(rgb):
+    """(r, g, b) 0-255 -> '#rrggbb', so plot and overlay share one definition."""
+    return "#%02x%02x%02x" % tuple(int(c) for c in rgb)
 
-    update_plot() clears the axis each redraw, so the formatter is re-applied
-    here every time rather than once at setup.
+
+class ContrastPlot(XYPlot):
+    """Contrast curves on the left axis, their ratio on a right-hand axis.
+
+    `series` is a list of (x, y, color, label) drawn against contrast on the
+    left. `ratio_series`, if set, is a single (x, y, color, label) drawn against
+    its own scale on the right: a ratio lives around 1 while contrasts sit
+    around 0.1-0.5, so sharing one axis would flatten both.
+
+    update_plot() clears the axes each redraw, so the formatters and legend are
+    re-applied every time rather than once at setup. The twin axis is created
+    once and reused -- making a new one per redraw would stack them up.
     """
+
+    def __init__(self, figsize):
+        super().__init__(figsize=figsize)
+        self.series = []
+        self.ratio_series = None
+        self._ratio_axis = None
 
     def update_plot(self):
         ax = self.first_axis
         ax.clear()
-        ax.plot(self.x, self.y, "k-")
+        handles = []
+        for x, y, color, label in self.series:
+            handles += ax.plot(x, y, "-", color=color, label=label)
         ax.yaxis.set_major_formatter(FormatStrFormatter("%.2f"))
+
+        legend_axis = ax
+        if self.ratio_series is not None:
+            if self._ratio_axis is None:
+                self._ratio_axis = ax.twinx()
+            rax = self._ratio_axis
+            rax.clear()
+            x, y, color, label = self.ratio_series
+            handles += rax.plot(x, y, "--", color=color, label=label)
+            rax.yaxis.set_major_formatter(FormatStrFormatter("%.2f"))
+            rax.tick_params(axis="y", labelcolor=color, labelsize="x-small")
+            # twinx draws the twin on top, so the legend goes there or the
+            # ratio line would be drawn over it.
+            legend_axis = rax
+
+        if handles:
+            legend_axis.legend(handles, [h.get_label() for h in handles],
+                               loc="upper right", fontsize="x-small",
+                               framealpha=0.6)
         self.figure.canvas.draw()
         self.figure.canvas.flush_events()
 
@@ -640,23 +730,34 @@ class SpeckleViewerApp(App):
                                 padx=8, pady=2, sticky="w")
         self.view.on_background_captured = self.on_background_captured
 
-        # --- live readout -----------------------------------------------------
-        self.readout = Box(label="ROI", width=360, height=205)
+        # --- live readout ------------------------------------------------------
+        # One column per ROI: field name in column 0, ROI i's value in column
+        # i+1. self.roi_labels[i][field] is the Label that on_stats writes.
+        self.readout = Box(label="ROI", width=520, height=250)
         self.readout.grid_into(self.controls, row=9, column=0, columnspan=3,
                                padx=8, pady=8, sticky="nsew")
-        self.contrast_label = Label("contrast: —")
-        self.mean_label = Label("mean: —    max: —")
-        self.sat_label = Label("saturated: —")
-        self.grain_label = Label("grain acf1: —")
-        self.roi_label = Label("ROI: —")
+        fields = [("contrast", "contrast:"), ("mean", "mean:"),
+                  ("max", "max:"), ("sat", "saturated:"),
+                  ("acf1", "grain acf1:"), ("roi", "at:")]
+        for i in range(N_ROIS):
+            Label(f"ROI {i + 1}").grid_into(self.readout, row=0, column=i + 1,
+                                            padx=8, pady=2, sticky="w")
+        self.roi_labels = [{} for _ in range(N_ROIS)]
+        for r, (key, caption) in enumerate(fields, start=1):
+            Label(caption).grid_into(self.readout, row=r, column=0, padx=8,
+                                     pady=2, sticky="e")
+            for i in range(N_ROIS):
+                lab = Label("—")
+                lab.grid_into(self.readout, row=r, column=i + 1, padx=8, pady=2,
+                              sticky="w")
+                self.roi_labels[i][key] = lab
+        self.ratio_label = Label("contrast ROI 1 / ROI 2: —")
         self.fps_label = Label("fps: —")
         self.dt_label = Label("frame Δt: —")
-        for i, lab in enumerate([self.contrast_label, self.mean_label,
-                                 self.sat_label, self.grain_label,
-                                 self.roi_label, self.fps_label,
-                                 self.dt_label]):
-            lab.grid_into(self.readout, row=i, column=0, padx=8, pady=2,
-                          sticky="w")
+        for r, lab in enumerate([self.ratio_label, self.fps_label, self.dt_label],
+                                start=len(fields) + 1):
+            lab.grid_into(self.readout, row=r, column=0, columnspan=N_ROIS + 1,
+                          padx=8, pady=2, sticky="w")
 
         # --- rolling contrast plot -------------------------------------------
         # Redrawing the plot every tick is the most expensive UI step; the
@@ -668,7 +769,7 @@ class SpeckleViewerApp(App):
         self.plot = ContrastPlot(figsize=(3.6, 1.8))
         self.plot.grid_into(self.controls, row=11, column=0, columnspan=3,
                             padx=8, pady=8, sticky="nsew")
-        self.history = deque()   # (t, contrast)
+        self.history = deque()   # (t, [contrast per ROI])
         self._t0 = time.monotonic()
 
         # True acquisition rate is derived in slow_tick from the stream counters
@@ -679,26 +780,39 @@ class SpeckleViewerApp(App):
         self._acq_drop_rate = 0.0
 
         self.camera.start()
+        self._install_signal_handlers()
         self.after(SLOW_MS, self.slow_tick)
 
     # -- callbacks -------------------------------------------------------------
-    def on_stats(self, s):
-        tag = "  (bg-sub)" if s.get("bg_subtracted") else ""
-        self.contrast_label.text = f"contrast:  {s['contrast']:.4f}{tag}"
-        self.mean_label.text = f"mean: {s['mean']:.0f}    max: {s['max']:.0f}"
-        self.sat_label.text = f"saturated: {100 * s['sat_frac']:.2f}%"
-        hint = ("~1px undersampled" if s["acf1"] < 0.2
-                else "~1.5px" if s["acf1"] < 0.4 else "~2px ok")
-        self.grain_label.text = f"grain acf1: {s['acf1']:.3f}  ({hint})"
-        t, l, sz = s["roi"]
-        nt = s.get("n_tiles", 1)
-        self.roi_label.text = f"ROI: {sz}px @ (row {t}, col {l})  {nt}×{nt} tiles"
+    def on_stats(self, stats):
+        """Fill the readout columns. `stats` is one dict per ROI, in order."""
+        for i, s in enumerate(stats):
+            tag = "  (bg-sub)" if s.get("bg_subtracted") else ""
+            lab = self.roi_labels[i]
+            lab["contrast"].text = f"{s['contrast']:.4f}{tag}"
+            lab["mean"].text = f"{s['mean']:.0f}"
+            lab["max"].text = f"{s['max']:.0f}"
+            lab["sat"].text = f"{100 * s['sat_frac']:.2f}%"
+            hint = ("~1px undersampled" if s["acf1"] < 0.2
+                    else "~1.5px" if s["acf1"] < 0.4 else "~2px ok")
+            lab["acf1"].text = f"{s['acf1']:.3f} ({hint})"
+            t, l, sz = s["roi"]
+            nt = s.get("n_tiles", 1)
+            lab["roi"].text = f"{sz}px (row {t}, col {l})  {nt}×{nt}"
+        # Contrast ratio between the two ROIs. Undefined when the denominator
+        # is zero (a dark or fully saturated ROI 2 gives contrast 0).
+        if len(stats) >= 2:
+            c1, c2 = stats[0]["contrast"], stats[1]["contrast"]
+            ratio = f"{c1 / c2:.3f}" if c2 > 0 else "—"
+            self.ratio_label.text = f"contrast ROI 1 / ROI 2: {ratio}"
         # fps (true acquisition rate) is owned by slow_tick via the stream
         # counters; here we report only the display refresh interval, so the two
         # numbers aren't confused (display is capped at ~1000/REFRESH_MS fps).
-        self.dt_label.text = (f"display Δt: {s['dt_mean_ms']:.1f} ± "
-                              f"{s['dt_std_ms']:.1f} ms")
-        self.history.append((time.monotonic() - self._t0, s["contrast"]))
+        if stats:
+            self.dt_label.text = (f"display Δt: {stats[0]['dt_mean_ms']:.1f} ± "
+                                  f"{stats[0]['dt_std_ms']:.1f} ms")
+        self.history.append((time.monotonic() - self._t0,
+                             [s["contrast"] for s in stats]))
 
     def slow_tick(self):
         # Apply exposure changes typed into the entry. Store the *requested*
@@ -757,8 +871,17 @@ class SpeckleViewerApp(App):
         while self.history and now - self.history[0][0] > PLOT_HISTORY_S:
             self.history.popleft()
         if self.update_plot_box.value and len(self.history) > 1:
-            self.plot.x = [t for t, _ in self.history]
-            self.plot.y = [c for _, c in self.history]
+            times = [t for t, _ in self.history]
+            self.plot.series = [
+                (times, [cs[i] for _, cs in self.history],
+                 _hex(ROI_COLORS[i]), f"ROI {i + 1}")
+                for i in range(N_ROIS)
+            ]
+            # NaN where ROI 2's contrast is zero: matplotlib breaks the line
+            # there instead of drawing an infinity.
+            ratios = [cs[0] / cs[1] if len(cs) > 1 and cs[1] > 0 else float("nan")
+                      for _, cs in self.history]
+            self.plot.ratio_series = (times, ratios, RATIO_COLOR, "ratio 1/2")
             self.plot.update_plot()
 
         if self.is_running:
@@ -773,7 +896,8 @@ class SpeckleViewerApp(App):
             button.label = "Stop"
 
     def center_roi(self, event, button):
-        self.view.roi_center = None  # recomputed to frame center next render
+        # Both ROIs are re-dropped at their default spread next render.
+        self.view.reset_roi_centers()
 
     def toggle_stretch(self, checkbox):
         self.view.stretch = bool(checkbox.value)
@@ -797,8 +921,14 @@ class SpeckleViewerApp(App):
     def toggle_hardware_roi(self, checkbox):
         if bool(checkbox.value):
             sw, sh = self.camera.sensor_size()
-            cx, cy = self.view.roi_center or (sw // 2, sh // 2)
-            region = self.camera.set_roi_region(cx, cy, int(self.roi_size_control.value))
+            # Engaged from a full-frame readout, so ROI 1's centre is in sensor
+            # pixels here. Give the crop some room: the two software ROIs have
+            # to fit side by side inside it.
+            cx, cy = self.view.roi_centers[0] or (sw // 2, sh // 2)
+            one = int(self.roi_size_control.value)
+            # A strip N ROIs wide but only one ROI tall: enough room to lay them
+            # out side by side, without paying N^2 pixels for it.
+            region = self.camera.set_roi_region(cx, cy, one * N_ROIS, height=one)
             self.view.hardware_roi = True
         else:
             region = self.camera.set_full_region()
@@ -819,8 +949,11 @@ class SpeckleViewerApp(App):
         except Exception as exc:
             print(f"Could not re-apply frame rate after ROI change: {exc}")
 
-        # Region change resizes the frame, so any captured background no longer fits.
+        # Region change resizes the frame, so any captured background no longer
+        # fits -- and the stored ROI centres are frame pixels, which a crop
+        # redefines. Drop both so they land inside the new frame.
         self.view.background = None
+        self.view.reset_roi_centers()
         x, y, w, h = region
         self.bg_label.text = f"background: re-capture (region now {w}×{h} @ {x},{y})"
 
@@ -847,6 +980,23 @@ class SpeckleViewerApp(App):
 
     def preferences(self):
         pass
+
+    def _install_signal_handlers(self):
+        """Release the camera on SIGINT/SIGTERM, not just on window close.
+
+        Without this a plain `kill` (or Ctrl-C) leaves the sensor acquiring, and
+        the next launch dies on the PixelFormat write. Tk's mainloop blocks in
+        C, so Python runs the handler on its next callback into Python -- the
+        display loop ticks every REFRESH_MS, so the delay is imperceptible.
+        """
+        def handler(sig, frame):
+            self.quit()
+
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                signal.signal(sig, handler)
+            except ValueError:
+                pass          # not the main thread: nothing to install
 
     def quit(self):
         try:
